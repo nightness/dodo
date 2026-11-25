@@ -4,7 +4,7 @@
 //! `RTCSessionDescription`, `RTCIceCandidate` and their events, as globals.
 //!
 //! The protocol stack (ICE, DTLS, SCTP, the data channel protocol) is
-//! webrtc-rs's sans-I/O `rtc` engine; `peer.rs` owns the sockets, the
+//! webrtc-rs's sans-I/O `rtci` engine; `peer.rs` owns the sockets, the
 //! timers and the STUN/TURN clients around it. The JavaScript side is
 //! `01_webrtc.js`.
 //!
@@ -36,10 +36,10 @@ use deno_core::v8;
 use deno_net::DefaultTlsOptions;
 use deno_net::UnsafelyIgnoreCertificateErrors;
 use deno_permissions::PermissionsContainer;
-use rtc::data_channel::RTCDataChannelInit;
-use rtc::peer_connection::certificate::CertificateParams;
-use rtc::peer_connection::certificate::RTCCertificate;
-use rtc::peer_connection::configuration::RTCBundlePolicy;
+use rtci::data_channel::RTCDataChannelInit;
+use rtci::peer_connection::certificate::CertificateParams;
+use rtci::peer_connection::certificate::RTCCertificate;
+use rtci::peer_connection::configuration::RTCBundlePolicy;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -75,10 +75,12 @@ const LOG_LEVELS: [log::LevelFilter; 6] = [
   log::LevelFilter::Trace,
 ];
 
-/// Whether a log record comes from the WebRTC engine (the `rtc` and `rtc_*`
+/// Whether a log record comes from the WebRTC engine (the `rtci` and `rtci_*`
 /// crates), whose records `Deno.webrtc.setLogLevel` governs.
 pub fn is_engine_log_target(target: &str) -> bool {
-  target == "rtc" || target.starts_with("rtc::") || target.starts_with("rtc_")
+  target == "rtci"
+    || target.starts_with("rtci::")
+    || target.starts_with("rtci_")
 }
 
 /// The engine's log level (`Deno.webrtc.setLogLevel`; off by default: its
@@ -759,7 +761,7 @@ fn certificate_info(
   state: &mut OpState,
   cert: RTCCertificate,
 ) -> Result<CertificateInfo, WebRtcError> {
-  let provider = rtc::crypto::default_provider()
+  let provider = rtci::crypto::default_provider()
     .map_err(|e| WebRtcError::Operation(e.to_string()))?;
   let fingerprints = cert
     .get_fingerprints(provider.crypto())
@@ -794,8 +796,8 @@ fn generate_certificate(
   alg: &KeygenArg,
   expires_at_ms: f64,
 ) -> Result<RTCCertificate, WebRtcError> {
-  use rtc::crypto::SignatureScheme;
-  let provider = rtc::crypto::default_provider()
+  use rtci::crypto::SignatureScheme;
+  let provider = rtci::crypto::default_provider()
     .map_err(|e| WebRtcError::Operation(e.to_string()))?;
   let name = alg.name.to_ascii_uppercase();
   let (scheme, signing_key) = match name.as_str() {
@@ -917,7 +919,7 @@ fn op_webrtc_certificate_from_pem(
   state: &mut OpState,
   #[string] pem: String,
 ) -> Result<CertificateInfo, WebRtcError> {
-  let provider = rtc::crypto::default_provider()
+  let provider = rtci::crypto::default_provider()
     .map_err(|e| WebRtcError::Operation(e.to_string()))?;
   let cert =
     RTCCertificate::from_pem(&pem, provider.crypto()).map_err(|e| {

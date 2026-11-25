@@ -507,6 +507,145 @@ async fn close_after_send_delivers_the_data_first() {
   b.close();
 }
 
+/// Waits for the open event of the channel labelled `label` (or, with
+/// `handle`, of that channel) and returns its handle and SCTP stream id.
+async fn wait_open(
+  peer: &Rc<Peer>,
+  seen: &mut Vec<JsEvent>,
+  label: &str,
+  handle: Option<u32>,
+) -> (u32, Option<u16>) {
+  let matches = |e: &JsEvent| match e {
+    JsEvent::DataChannelOpen {
+      channel, label: l, ..
+    } => l == label && handle.is_none_or(|h| h == *channel),
+    _ => false,
+  };
+  wait_for(peer, seen, &matches).await;
+  seen
+    .iter()
+    .find_map(|e| match e {
+      JsEvent::DataChannelOpen { channel, id, .. } if matches(e) => {
+        Some((*channel, *id))
+      }
+      _ => None,
+    })
+    .unwrap()
+}
+
+/// The messages that arrived on one channel, in order.
+fn messages_on(events: &[JsEvent], on: u32) -> Vec<(bool, Vec<u8>)> {
+  events
+    .iter()
+    .filter_map(|e| match e {
+      JsEvent::DataChannelMessage {
+        channel,
+        text,
+        data,
+      } if *channel == on => Some((*text, data.bytes())),
+      _ => None,
+    })
+    .collect()
+}
+
+/// One connection carries many data channels over its one SCTP association:
+/// in-band channels opened by both sides once it is up, each with its own
+/// reliability, next to a negotiated one; every channel has its own stream
+/// id, every message arrives on the channel it was sent on, and closing one
+/// channel leaves the others working.
+#[tokio::test]
+async fn many_channels_on_one_connection() {
+  let (a, b, chat, mut ea, mut eb) = connect(reliable()).await;
+  let (fast, _) = a
+    .create_data_channel(
+      "fast",
+      RTCDataChannelInit {
+        ordered: false,
+        max_retransmits: Some(0),
+        ..Default::default()
+      },
+    )
+    .unwrap();
+  let (files, _) = a.create_data_channel("files", reliable()).unwrap();
+  let (back, _) = b.create_data_channel("back", reliable()).unwrap();
+  let negotiated = || RTCDataChannelInit {
+    negotiated: Some(100),
+    ..reliable()
+  };
+  let (side_a, _) = a.create_data_channel("side", negotiated()).unwrap();
+  let (side_b, _) = b.create_data_channel("side", negotiated()).unwrap();
+
+  // Each side sees its own channels open and the peer's in-band ones arrive.
+  let (_, chat_id) = wait_open(&a, &mut ea, "chat", Some(chat)).await;
+  let (_, fast_id) = wait_open(&a, &mut ea, "fast", Some(fast)).await;
+  let (_, files_id) = wait_open(&a, &mut ea, "files", Some(files)).await;
+  let (_, side_id) = wait_open(&a, &mut ea, "side", Some(side_a)).await;
+  let (back_on_a, back_id) = wait_open(&a, &mut ea, "back", None).await;
+  let (chat_on_b, _) = wait_open(&b, &mut eb, "chat", None).await;
+  let (fast_on_b, _) = wait_open(&b, &mut eb, "fast", None).await;
+  let (files_on_b, _) = wait_open(&b, &mut eb, "files", None).await;
+  wait_open(&b, &mut eb, "side", Some(side_b)).await;
+  wait_open(&b, &mut eb, "back", Some(back)).await;
+  let mut ids = vec![chat_id, fast_id, files_id, side_id, back_id];
+  assert!(ids.iter().all(Option::is_some), "stream ids: {ids:?}");
+  assert_eq!(side_id, Some(100));
+  ids.sort_unstable();
+  ids.dedup();
+  assert_eq!(ids.len(), 5, "every channel has its own stream id");
+  let remote_settings = eb.iter().find_map(|e| match e {
+    JsEvent::DataChannelOpen {
+      channel,
+      ordered,
+      max_retransmits,
+      ..
+    } if *channel == fast_on_b => Some((*ordered, *max_retransmits)),
+    _ => None,
+  });
+  assert_eq!(remote_settings, Some((false, Some(0))));
+
+  a.send(chat, true, b"on chat").unwrap();
+  a.send(fast, false, &[1, 2, 3]).unwrap();
+  a.send(files, false, &[9u8; 64 * 1024]).unwrap();
+  a.send(side_a, true, b"on side from a").unwrap();
+  b.send(back, true, b"on back").unwrap();
+  b.send(side_b, true, b"on side from b").unwrap();
+  b.send(chat_on_b, true, b"on chat from b").unwrap();
+  wait_messages(&b, &mut eb, 4).await;
+  wait_messages(&a, &mut ea, 3).await;
+  assert_eq!(messages_on(&eb, chat_on_b), [(true, b"on chat".to_vec())]);
+  assert_eq!(messages_on(&eb, fast_on_b), [(false, vec![1, 2, 3])]);
+  assert_eq!(
+    messages_on(&eb, files_on_b),
+    [(false, vec![9u8; 64 * 1024])]
+  );
+  assert_eq!(
+    messages_on(&eb, side_b),
+    [(true, b"on side from a".to_vec())]
+  );
+  assert_eq!(messages_on(&ea, back_on_a), [(true, b"on back".to_vec())]);
+  assert_eq!(
+    messages_on(&ea, side_a),
+    [(true, b"on side from b".to_vec())]
+  );
+  assert_eq!(messages_on(&ea, chat), [(true, b"on chat from b".to_vec())]);
+
+  // Closing one channel closes it on both sides and nothing else.
+  a.close_data_channel(files);
+  let closed = |on: u32| move |e: &JsEvent| matches!(e, JsEvent::DataChannelClose { channel } if *channel == on);
+  wait_for(&b, &mut eb, closed(files_on_b)).await;
+  for channel in [chat_on_b, fast_on_b, side_b, back] {
+    assert!(!eb.iter().any(closed(channel)), "channel {channel} closed");
+  }
+  a.send(chat, true, b"still here").unwrap();
+  wait_messages(&b, &mut eb, 5).await;
+  assert_eq!(
+    messages_on(&eb, chat_on_b),
+    [(true, b"on chat".to_vec()), (true, b"still here".to_vec())]
+  );
+  a.close();
+  b.close();
+}
+
 #[test]
 fn stream_frames() {
   use crate::peer::frame_len_for_tests as len;

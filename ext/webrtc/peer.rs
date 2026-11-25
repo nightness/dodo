@@ -1,0 +1,3994 @@
+// Copyright 2018-2026 the Deno authors. MIT license.
+
+//! One `RTCPeerConnection`: webrtc-rs's sans-I/O `rtc` engine plus the I/O
+//! that engine leaves to its host, owned here.
+//!
+//! `rtc` runs ICE, DTLS, SCTP and the data channels as state machines: it
+//! never opens a socket, arms a timer or reads the clock. This module gives
+//! each peer connection
+//!
+//! - one UDP socket per address family. With interface enumeration and a
+//!   listen grant for the wildcard address it is bound to `0.0.0.0` (and
+//!   `[::]` when the machine has a usable IPv6 address), and every interface
+//!   address becomes a host candidate on that port; otherwise it is bound to
+//!   `127.0.0.1` alone. The engine matches a datagram to a local candidate by
+//!   its exact local address, which a wildcard socket doesn't report, so the
+//!   local address of a datagram from a peer is the address the OS routes to
+//!   that peer from (a connected probe socket, cached per peer: bounded, and
+//!   only for a peer ICE or the permission gate vouched for);
+//! - one sans-I/O STUN/TURN client per ICE server URL: over the UDP socket,
+//!   or over its own TCP or TLS connection for `?transport=tcp` and `turns:`
+//!   (RFC 6544 framing: STUN messages and padded ChannelData on the stream);
+//! - on a `tcpPort` network (net.rs), ICE over TCP (RFC 6544): passive host
+//!   candidates on the network's listeners and an active one (port 9) per
+//!   host address; a check to a remote passive candidate dials it, and each
+//!   connection, accepted or dialled, carries RFC 4571 frames;
+//! - mDNS (`.local` host candidates): one multicast socket on port 5353,
+//!   opened when a remote `.local` candidate needs resolving or, on an
+//!   `mdns: true` network, when the connection publishes its own;
+//! - a driver task that moves datagrams between the sockets, those clients
+//!   and the engine, fires the timers and queues the engine's events for
+//!   JavaScript.
+//!
+//! Guards the engine doesn't provide:
+//!
+//! - **Net permission gate** ([`NetGuard`]): every datagram is sent only to
+//!   an allowed address (checked once per address); a refused one is never
+//!   sent to and is reported as an `icecandidateerror`.
+//! - **Selected-pair filter**: the engine doesn't check where a non-STUN
+//!   packet (DTLS, SCTP inside it, RTP) comes from, so only those from the
+//!   selected candidate pair reach it (see [`Core::is_from_selected_pair`]); STUN is
+//!   authenticated by ICE itself.
+//! - **DTLS watchdog**: the engine logs and drops handshake errors, so a
+//!   connection whose ICE is up but whose DTLS hasn't connected within
+//!   [`DTLS_TIMEOUT`] is reported as `failed`.
+//! - **Panic boundary**: a panic in the engine poisons the connection (it
+//!   reports `failed` and closes) instead of unwinding into the runtime. In a
+//!   `panic = "abort"` build (Deno's release profile) a panic still aborts.
+//!
+//! Everything runs on the isolate's thread: ops and the driver share the
+//! [`Core`] through a `RefCell` and never hold it across an `.await`.
+
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
+use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
+use std::rc::Rc;
+use std::rc::Weak;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
+
+use bytes::BytesMut;
+use deno_core::CancelFuture;
+use deno_core::CancelHandle;
+use deno_core::ToJsBuffer;
+use rtc::data_channel::RTCDataChannelId;
+use rtc::data_channel::RTCDataChannelInit;
+use rtc::data_channel::RTCDataChannelState;
+use rtc::ice::mdns::MulticastDnsMode;
+use rtc::ice::tcp_type::TcpType;
+use rtc::ice::url::ProtoType;
+use rtc::ice::url::SchemeType;
+use rtc::ice::url::Url as IceUrl;
+use rtc::mdns::MDNS_DEST_ADDR;
+use rtc::mdns::MDNS_PORT;
+use rtc::peer_connection::RTCPeerConnection;
+use rtc::peer_connection::RTCPeerConnectionBuilder;
+use rtc::peer_connection::certificate::RTCCertificate;
+use rtc::peer_connection::configuration::RTCBundlePolicy;
+use rtc::peer_connection::configuration::RTCConfigurationBuilder;
+use rtc::peer_connection::configuration::setting_engine::SctpMaxMessageSize;
+use rtc::peer_connection::configuration::setting_engine::SettingEngineBuilder;
+use rtc::peer_connection::event::RTCDataChannelEvent;
+use rtc::peer_connection::event::RTCPeerConnectionEvent;
+use rtc::peer_connection::event::RTCTrackEvent;
+use rtc::peer_connection::message::RTCMessage;
+use rtc::peer_connection::sdp::RTCSessionDescription;
+use rtc::peer_connection::transport::CandidateConfig;
+use rtc::peer_connection::transport::CandidateHostConfig;
+use rtc::peer_connection::transport::CandidateRelayConfig;
+use rtc::peer_connection::transport::CandidateServerReflexiveConfig;
+use rtc::peer_connection::transport::RTCIceCandidate;
+use rtc::peer_connection::transport::RTCIceCandidateInit;
+use rtc::peer_connection::transport::RTCIceCandidateType;
+use rtc::peer_connection::transport::RTCSctpTransportState;
+use rtc::sansio::Protocol;
+use rtc::shared::EcnCodepoint;
+use rtc::shared::TaggedBytesMut;
+use rtc::shared::TransportContext;
+use rtc::shared::TransportProtocol;
+use rtc::shared::error::Error as RtcError;
+use rtc::shared::marshal::Marshal;
+use rtc::shared::tcp_framing::TcpFrameDecoder;
+use rtc::shared::tcp_framing::try_frame_packet;
+use rtc::statistics::StatsSelector;
+use rtc::statistics::report::RTCStatsReportEntry;
+use rtc::stun::message::TransactionId;
+use rtc::turn::client::Client as TurnClient;
+use rtc::turn::client::ClientConfig as TurnClientConfig;
+use rtc::turn::client::Event as TurnEvent;
+use serde::Serialize;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::UdpSocket;
+use tokio::sync::Notify;
+use tokio::sync::mpsc;
+
+use crate::WebRtcError;
+use crate::ecn::EcnUdpSocket;
+use crate::media::MediaState;
+use crate::net::MdnsMode;
+use crate::net::Network;
+use crate::net::NetworkOptions;
+
+/// The largest UDP payload read from a socket. ICE, DTLS and SCTP packets
+/// stay under the path MTU; this leaves room for jumbo frames.
+const RECV_BUFFER_SIZE: usize = 9216;
+/// Datagrams queued between the socket readers and the driver. A full queue
+/// drops new datagrams, as a full socket buffer would.
+const RECV_QUEUE: usize = 4096;
+/// How many times one driver pass loops over writes, server clients and
+/// events before it waits again (each loop can produce more work, e.g. a
+/// relayed datagram the engine answers).
+const MAX_PUMP_ROUNDS: usize = 32;
+/// `icecandidateerror` code for "no server response / not reachable", the
+/// code browsers use for gathering failures without a STUN error code.
+const ERROR_CODE_UNREACHABLE: u16 = 701;
+/// How long DTLS may take once ICE is connected before the connection is
+/// reported as failed (the handshake retransmits for up to ~60 s in the
+/// engine, but a peer that connects ICE and never finishes DTLS is broken:
+/// a wrong fingerprint, a certificate the engine refused).
+pub const DTLS_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long ICE may stay `checking` without a connection while the remote
+/// side hasn't signalled end-of-candidates before it is reported
+/// `disconnected` (W3C webrtc-pc 4.3.3: checked the pairs it has and found no
+/// connection, still waiting for remote candidates). The engine's own
+/// disconnected timeout.
+const CHECKING_STALL: Duration = Duration::from_secs(5);
+/// Remote addresses remembered as having sent STUN.
+const MAX_STUN_PEERS: usize = 256;
+/// Peer IPs whose local route is cached (wildcard sockets).
+pub(crate) const MAX_ROUTES: usize = 1024;
+/// The largest frame read from a TCP/TLS TURN connection (a STUN message or
+/// a ChannelData frame: 4 + 65535 bytes, padded).
+const MAX_STREAM_FRAME: usize = 4 + 65536;
+/// The port an active ICE-TCP candidate is signalled with (RFC 6544 §4.5):
+/// it connects out and never listens.
+const ACTIVE_TCP_PORT: u16 = 9;
+/// ICE-TCP connections (accepted and dialled) one peer connection keeps.
+const MAX_TCP_LINKS: usize = 32;
+/// Frames queued for one ICE-TCP connection's writer; a full queue drops
+/// new ones, as a full UDP socket buffer would (ICE and DTLS retransmit).
+const TCP_WRITE_QUEUE: usize = 256;
+/// Frames held for a remote passive candidate while it is being dialled.
+const MAX_DIAL_QUEUE: usize = 8;
+/// How long dialling a remote passive candidate may take.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an mDNS query for a remote `.local` candidate is retried.
+const MDNS_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The longest TURN username STUN carries (RFC 8489 section 14.3).
+const MAX_TURN_USERNAME_BYTES: usize = 509;
+
+/// The net permission gate. Production code wraps the runtime's
+/// `PermissionsContainer` (lib.rs); tests use their own guards.
+pub trait NetGuard {
+  /// May the connection send to `addr`? (`--allow-net` /
+  /// `--allow-net-connect` for `ip:port`.)
+  fn connect(&self, addr: SocketAddr) -> Result<(), String>;
+  /// May the connection bind a UDP socket on `ip`? (`--allow-net` /
+  /// `--allow-net-listen` for `ip`.)
+  fn listen(&self, ip: IpAddr) -> Result<(), String>;
+  /// May the connection list the machine's interface addresses (its host
+  /// candidates)? (`--allow-sys=networkInterfaces`, as
+  /// `Deno.networkInterfaces()`.)
+  fn interfaces(&self) -> Result<(), String>;
+}
+
+/// How a STUN/TURN client reaches its server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerTransport {
+  Udp,
+  Tcp,
+  Tls,
+}
+
+/// A STUN or TURN server URL from `RTCConfiguration.iceServers`, parsed and
+/// permission-checked by the constructor.
+#[derive(Clone, Debug)]
+pub struct IceServerSpec {
+  pub url: String,
+  pub turn: bool,
+  pub host: String,
+  pub port: u16,
+  pub username: String,
+  pub credential: String,
+  pub transport: ServerTransport,
+}
+
+impl IceServerSpec {
+  /// Parses one URL of an `RTCIceServer`. `Err` is the W3C `SyntaxError`
+  /// (bad URL) or `InvalidAccessError` (TURN without usable credentials)
+  /// message.
+  pub fn parse(
+    url: &str,
+    username: Option<&str>,
+    credential: Option<&str>,
+  ) -> Result<Self, WebRtcError> {
+    let parsed = IceUrl::parse_url(url).map_err(|e| {
+      WebRtcError::Syntax(format!("Invalid ICE server URL '{url}': {e}"))
+    })?;
+    // RFC 7064 / 7065: `scheme ":" host [":" port]` and, for TURN, a
+    // `?transport=` query; no userinfo, authority or path.
+    let address = url
+      .split_once(':')
+      .map_or("", |(_, rest)| rest.split('?').next().unwrap_or_default());
+    if address.contains(['@', '/', '\\']) {
+      return Err(WebRtcError::Syntax(format!(
+        "Invalid ICE server URL '{url}': only a host and a port may follow the scheme"
+      )));
+    }
+    let turn = matches!(parsed.scheme, SchemeType::Turn | SchemeType::Turns);
+    if turn {
+      match (username, credential) {
+        (Some(username), Some(credential))
+          if !credential.is_empty()
+            && username.len() <= MAX_TURN_USERNAME_BYTES => {}
+        (Some(username), Some(_))
+          if username.len() > MAX_TURN_USERNAME_BYTES =>
+        {
+          return Err(WebRtcError::InvalidAccess(format!(
+            "TURN server '{url}': the username is longer than {MAX_TURN_USERNAME_BYTES} bytes"
+          )));
+        }
+        _ => {
+          return Err(WebRtcError::InvalidAccess(format!(
+            "TURN server '{url}' needs a username and a non-empty credential"
+          )));
+        }
+      }
+    }
+    let transport = match (parsed.scheme, parsed.proto) {
+      (SchemeType::Turns | SchemeType::Stuns, _) => ServerTransport::Tls,
+      (_, ProtoType::Tcp) => ServerTransport::Tcp,
+      _ => ServerTransport::Udp,
+    };
+    Ok(Self {
+      url: url.to_string(),
+      turn,
+      host: parsed.host.trim_matches(['[', ']']).to_string(),
+      port: parsed.port,
+      username: username.unwrap_or_default().to_string(),
+      credential: credential.unwrap_or_default().to_string(),
+      transport,
+    })
+  }
+}
+
+/// The stats fields the engine writes from a `SystemInstant`, as
+/// milliseconds since the epoch (`rtc_shared::serde::instant_to_epoch`).
+const STATS_EPOCH_FIELDS: [&str; 5] = [
+  "timestamp",
+  "lastPacketSentTimestamp",
+  "lastPacketReceivedTimestamp",
+  "remoteTimestamp",
+  "estimatedPlayoutTimestamp",
+];
+
+/// Adds the packets the pacer's full queue refused
+/// ([`crate::media::FactorPacer`]) to the selected candidate pair's
+/// `packetsDiscardedOnSend` / `bytesDiscardedOnSend`, beside the
+/// `availableOutgoingBitrate` that pacer follows: like a packet the socket
+/// refused, it never left. The count is the connection's (one pacer).
+pub(crate) fn add_pacer_refusals(
+  stats: &mut [serde_json::Value],
+  (packets, bytes): (u64, u64),
+) {
+  if packets == 0 {
+    return;
+  }
+  let Some(selected) = stats
+    .iter()
+    .find(|s| s["type"] == "transport")
+    .and_then(|s| s["selectedCandidatePairId"].as_str())
+    .map(str::to_owned)
+  else {
+    return;
+  };
+  for s in stats.iter_mut() {
+    if s["type"] == "candidate-pair" && s["id"] == selected.as_str() {
+      for (key, n) in [
+        ("packetsDiscardedOnSend", packets),
+        ("bytesDiscardedOnSend", bytes),
+      ] {
+        let before = s[key].as_u64().unwrap_or(0);
+        s[key] = (before + n).into();
+      }
+    }
+  }
+}
+
+/// One stats dictionary with its epoch fields made relative to `wall_ms`, the
+/// wall clock (milliseconds since the epoch) when the report was asked for:
+/// JavaScript adds the Performance time of that moment, so the timestamps are
+/// `DOMHighResTimeStamp`s on `performance.timeOrigin`'s timeline (W3C
+/// webrtc-stats, hr-time) whatever the wall clock does.
+pub fn epoch_fields_relative(
+  mut stats: serde_json::Value,
+  wall_ms: f64,
+) -> serde_json::Value {
+  if let Some(map) = stats.as_object_mut() {
+    for key in STATS_EPOCH_FIELDS {
+      if let Some(ms) = map.get(key).and_then(serde_json::Value::as_f64) {
+        map.insert(key.to_string(), serde_json::json!(ms - wall_ms));
+      }
+    }
+  }
+  stats
+}
+
+/// Options for [`Peer::new`], from `RTCConfiguration`.
+#[derive(Default)]
+pub struct PeerOptions {
+  pub ice_servers: Vec<IceServerSpec>,
+  /// `iceTransportPolicy: "relay"`: only relay candidates are signalled.
+  pub relay_only: bool,
+  /// For `turns:` servers: the runtime's TLS client configuration (its root
+  /// store, `--unsafely-ignore-certificate-errors`).
+  pub tls: Option<Arc<rustls::ClientConfig>>,
+  /// `RTCConfiguration.certificates` (one is generated when empty).
+  pub certificates: Vec<RTCCertificate>,
+  /// `RTCConfiguration.bundlePolicy`.
+  pub bundle_policy: RTCBundlePolicy,
+  /// `RTCConfiguration.denoNetwork` (net.rs).
+  pub network: Option<Rc<Network>>,
+}
+
+/// An event for JavaScript, delivered in batches by
+/// `op_webrtc_pc_next_events`. Data channels are named by their engine
+/// handle (`channel`), which exists before the SCTP stream id does.
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+pub enum JsEvent {
+  #[serde(rename = "icecandidate", rename_all = "camelCase")]
+  IceCandidate {
+    candidate: String,
+    sdp_mid: Option<String>,
+    #[serde(rename = "sdpMLineIndex")]
+    sdp_m_line_index: Option<u16>,
+    username_fragment: Option<String>,
+    url: Option<String>,
+  },
+  #[serde(rename = "icecandidateerror", rename_all = "camelCase")]
+  IceCandidateError {
+    address: Option<String>,
+    port: Option<u16>,
+    url: String,
+    error_code: u16,
+    error_text: String,
+  },
+  #[serde(rename = "signalingstatechange")]
+  SignalingState { state: String },
+  #[serde(rename = "icegatheringstatechange")]
+  IceGatheringState { state: String },
+  #[serde(rename = "iceconnectionstatechange")]
+  IceConnectionState { state: String },
+  #[serde(rename = "connectionstatechange")]
+  ConnectionState { state: String },
+  #[serde(rename = "negotiationneeded")]
+  NegotiationNeeded,
+  /// `RTCSctpTransport.state`, from the SCTP association.
+  #[serde(rename = "sctpstatechange")]
+  SctpState { state: &'static str },
+  /// The DTLS transport's own state, as the engine has it (the peer's
+  /// close_notify closes it while the connection stays `connected`).
+  #[serde(rename = "dtlsstatechange")]
+  DtlsState { state: String },
+  #[serde(rename = "dcopen", rename_all = "camelCase")]
+  DataChannelOpen {
+    channel: u32,
+    id: Option<u16>,
+    label: String,
+    protocol: String,
+    ordered: bool,
+    max_packet_life_time: Option<u16>,
+    max_retransmits: Option<u16>,
+    negotiated: bool,
+    /// The DCEP priority (RFC 8832 5.1): the peer's, for a channel it opened.
+    priority: u16,
+  },
+  #[serde(rename = "dcclosing")]
+  DataChannelClosing { channel: u32 },
+  #[serde(rename = "dcclose")]
+  DataChannelClose { channel: u32 },
+  #[serde(rename = "dcerror")]
+  DataChannelError { channel: u32 },
+  /// SCTP took `bytes` more of the channel's application data from its send
+  /// queue (W3C: "when the underlying data transport sends data from its
+  /// queue ... reduce [[BufferedAmount]]").
+  #[serde(rename = "dcsent")]
+  DataChannelSent { channel: u32, bytes: f64 },
+  #[serde(rename = "dcmessage")]
+  DataChannelMessage {
+    channel: u32,
+    text: bool,
+    data: Payload,
+  },
+  /// A receiver's first RTP packet: its track unmutes.
+  #[serde(rename = "trackunmute")]
+  TrackUnmute { transceiver: u32 },
+  /// An RTP packet for a `Deno.webrtc.readRtp()` reader (header included).
+  #[serde(rename = "rtp")]
+  Rtp { transceiver: u32, data: Payload },
+  /// The remote receiver asked a sender for a key frame (PLI / FIR).
+  #[serde(rename = "keyframerequest")]
+  KeyFrameRequest { transceiver: u32 },
+  /// A received frame, for the receiver's encoded transform.
+  #[serde(rename = "encodedframe")]
+  EncodedFrame {
+    transceiver: u32,
+    data: Payload,
+    #[serde(rename = "keyFrame")]
+    key_frame: bool,
+    width: Option<u16>,
+    height: Option<u16>,
+    info: crate::encoded_frames::ReceivedFrameInfo,
+  },
+  /// A receiver's RTP stopped for `media_sink::SILENCE`: its track mutes.
+  #[serde(rename = "trackmute")]
+  TrackMute { transceiver: u32 },
+  /// A receiver's video names a new coded size (`getSettings()`).
+  #[serde(rename = "trackresize")]
+  TrackResize {
+    transceiver: u32,
+    width: u32,
+    height: u32,
+  },
+  /// A received frame, for `Deno.webrtc.readFrames()` readers.
+  #[serde(rename = "mediaframe")]
+  MediaFrame {
+    transceiver: u32,
+    data: Payload,
+    #[serde(rename = "keyFrame")]
+    key_frame: bool,
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    #[serde(rename = "rtpTimestamp")]
+    rtp_timestamp: u32,
+    width: Option<u32>,
+    height: Option<u32>,
+  },
+}
+
+/// A received message's bytes, handed to V8 without a copy (as a
+/// `ToJsBuffer`) when the event is serialized.
+#[derive(Debug)]
+pub struct Payload(RefCell<Option<Vec<u8>>>);
+
+impl Payload {
+  fn new(bytes: Vec<u8>) -> Self {
+    Self(RefCell::new(Some(bytes)))
+  }
+
+  #[cfg(test)]
+  pub fn bytes(&self) -> Vec<u8> {
+    self.0.borrow().clone().unwrap_or_default()
+  }
+}
+
+impl Serialize for Payload {
+  fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+    let bytes = self.0.borrow_mut().take().unwrap_or_default();
+    ToJsBuffer::from(bytes).serialize(s)
+  }
+}
+
+/// A datagram one of the readers received. `stream` is the index of the
+/// server client whose TCP/TLS connection carried it.
+pub(crate) struct Datagram {
+  pub(crate) local: SocketAddr,
+  pub(crate) from: SocketAddr,
+  pub(crate) stream: Option<usize>,
+  /// Which kind of socket it came from.
+  pub(crate) via: Via,
+  pub(crate) data: BytesMut,
+  /// A TCP/TLS link to a TURN server ended (`stream` names it): why.
+  pub(crate) closed: Option<String>,
+  /// The ECN codepoint a UDP datagram arrived with (`None`: Not-ECT, or a
+  /// socket without ECN; always `None` over TCP and TURN).
+  pub(crate) ecn: Option<EcnCodepoint>,
+}
+
+/// Where a [`Datagram`] came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+  /// A UDP socket, or a TURN server's stream (`Datagram::stream`).
+  Socket,
+  /// The ICE-TCP connection with this id.
+  IceTcp(u64),
+  /// The mDNS socket.
+  Mdns,
+}
+
+/// One ICE-TCP connection, accepted on a passive candidate or dialled from
+/// an active one.
+struct TcpLink {
+  id: u64,
+  writer: mpsc::Sender<Vec<u8>>,
+}
+
+/// The connection's UDP socket for one address family.
+struct UdpEndpoint {
+  socket: Rc<EcnUdpSocket>,
+  /// What the socket is bound to; a wildcard address for a wildcard bind.
+  bound: SocketAddr,
+  /// The host candidate addresses on this socket's port.
+  hosts: Vec<IpAddr>,
+}
+
+enum ServerLink {
+  Udp,
+  /// A TCP or TLS connection: frames for the writer task.
+  Stream(mpsc::UnboundedSender<Vec<u8>>),
+}
+
+/// One STUN/TURN client, for one ICE server URL.
+struct ServerClient {
+  url: String,
+  client: TurnClient,
+  /// The client's local address: a host candidate address on the UDP
+  /// socket, or the stream's local address.
+  base: SocketAddr,
+  server: SocketAddr,
+  link: ServerLink,
+  binding: Option<TransactionId>,
+  allocate: Option<TransactionId>,
+  relay: Option<SocketAddr>,
+}
+
+impl ServerClient {
+  fn pending(&self) -> bool {
+    self.binding.is_some() || self.allocate.is_some()
+  }
+
+  fn protocol(&self) -> TransportProtocol {
+    match self.link {
+      ServerLink::Udp => TransportProtocol::UDP,
+      ServerLink::Stream(_) => TransportProtocol::TCP,
+    }
+  }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GatherPhase {
+  NotStarted,
+  Running,
+  Complete,
+}
+
+/// The engine and the I/O state around it, shared by ops and the driver.
+pub struct Core {
+  pub pc: RTCPeerConnection,
+  options: PeerOptions,
+  endpoints: Vec<UdpEndpoint>,
+  servers: Vec<ServerClient>,
+  gathering: GatherPhase,
+  /// ICE server URLs still being resolved / connected before their client
+  /// exists.
+  resolving: usize,
+  srflx_seen: HashSet<SocketAddr>,
+  pub(crate) events: VecDeque<JsEvent>,
+  allowed: HashSet<SocketAddr>,
+  refused: HashSet<SocketAddr>,
+  /// Peer IP -> the local IP the OS routes to it from (wildcard sockets).
+  /// Only for addresses ICE or the permission gate vouched for (see
+  /// [`Core::local_for`]), and at most [`MAX_ROUTES`].
+  routes: HashMap<IpAddr, IpAddr>,
+  /// The selected candidate pair as (local, remote): where the engine's
+  /// last non-STUN datagram went.
+  selected: Option<(SocketAddr, SocketAddr)>,
+  /// Remote addresses that sent STUN (see [`Core::is_from_selected_pair`]).
+  stun_peers: HashSet<SocketAddr>,
+  /// ICE is connected or completed.
+  ice_up: bool,
+  /// When ICE last reached connected/completed while DTLS hadn't.
+  ice_up_at: Option<Instant>,
+  dtls_connected: bool,
+  /// A synthetic `failed` was reported (watchdog or panic): later engine
+  /// connection states other than `closed` are not reported.
+  failed: bool,
+  recv_tx: mpsc::Sender<Datagram>,
+  recv_rx: Option<mpsc::Receiver<Datagram>>,
+  /// Transceivers, senders and receivers (media.rs).
+  pub(crate) media: MediaState,
+  /// Receivers whose frames go to an encoded transform (encoded_frames.rs).
+  pub(crate) transforms: crate::encoded_frames::ReceiverTransforms,
+  /// Received frames, sizes and silence per receiver (media_sink.rs).
+  pub(crate) sinks: crate::media_sink::MediaSinks,
+  /// A remote candidate is known (signalled, or a check arrived): until
+  /// then ICE stays `new`, as the spec's `checking` needs one.
+  remote_known: bool,
+  /// The engine went `checking` before that: reported once one is.
+  checking_held: bool,
+  /// An ICE restart's `checking` on a connected transport was not reported
+  /// (see `collect_events`); cleared by the next other ICE state.
+  restart_masked: bool,
+  /// When `checking` was last reported (see [`CHECKING_STALL`]).
+  checking_since: Option<Instant>,
+  /// Per data channel handle, the application bytes SCTP had taken from the
+  /// send queue when last reported (`track_sent`).
+  sent: HashMap<u32, u64>,
+  /// The `RTCSctpTransport` state last reported ("" before any).
+  sctp_state: &'static str,
+  /// The DTLS transport state last reported ("" before any).
+  dtls_state: String,
+  /// Local candidates signalled in this gathering phase (an ICE restart
+  /// starts a new one).
+  local_gathered: usize,
+  /// The remote side signalled end-of-candidates for its current ICE
+  /// generation (`addIceCandidate` with an empty candidate, or
+  /// `a=end-of-candidates`).
+  remote_gathered: bool,
+  /// The connection itself, for a shared-port network's routes.
+  this: Weak<Peer>,
+  /// ICE-TCP connections by remote address.
+  tcp_links: HashMap<SocketAddr, TcpLink>,
+  /// Remote passive candidates being dialled, with the frames waiting for
+  /// the connection.
+  tcp_dialing: HashMap<SocketAddr, Vec<Vec<u8>>>,
+  next_tcp_link: u64,
+  /// The selected pair is an ICE-TCP one.
+  selected_tcp: bool,
+  /// What this connection does with `.local` candidates (`Off` when mDNS
+  /// can't be used here: loopback only, or a permission refused).
+  mdns_mode: MdnsMode,
+  /// The mDNS socket, once opened.
+  mdns_socket: Option<Rc<EcnUdpSocket>>,
+  /// Opening the mDNS socket failed (reported once).
+  mdns_failed: bool,
+  /// 1:1 NAT in host mode is the engine's (`with_nat_1to1_ips`): a host
+  /// candidate is added on its private address and announced on the public
+  /// one, its base staying the private socket, so the addresses the engine
+  /// reads and writes on are the sockets' own. Off with mDNS names (the
+  /// engine can't map a name), where the public address is signalled here.
+  engine_nat: bool,
+}
+
+/// One candidate of [`SelectedPair`], with the fields JavaScript needs to
+/// build the `RTCIceCandidate` (a peer-reflexive remote candidate is exposed
+/// without its address, so it can't be found among the signalled ones).
+#[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PairCandidate {
+  /// `ip:port` (`[ip]:port` for IPv6), as the signalled candidates are matched.
+  pub addr: String,
+  pub address: String,
+  pub port: u16,
+  pub protocol: String,
+  #[serde(rename = "type")]
+  pub typ: String,
+  pub foundation: String,
+  pub priority: u32,
+  pub related_address: String,
+  pub related_port: u16,
+}
+
+impl PairCandidate {
+  pub(crate) fn of(
+    c: &rtc::peer_connection::transport::RTCIceCandidate,
+  ) -> Self {
+    let addr = match c.address.parse::<IpAddr>() {
+      Ok(IpAddr::V6(ip)) => format!("[{ip}]:{}", c.port),
+      Ok(IpAddr::V4(ip)) => format!("{ip}:{}", c.port),
+      Err(_) => format!("{}:{}", c.address, c.port),
+    };
+    Self {
+      addr,
+      address: c.address.clone(),
+      port: c.port,
+      protocol: c.protocol.to_string(),
+      typ: c.typ.to_string(),
+      foundation: c.foundation.clone(),
+      priority: c.priority,
+      related_address: c.related_address.clone(),
+      related_port: c.related_port,
+    }
+  }
+}
+
+/// The ICE agent's selected candidate pair.
+#[derive(serde::Serialize, Debug)]
+pub struct SelectedPair {
+  pub local: PairCandidate,
+  pub remote: PairCandidate,
+}
+
+/// The four description slots of a connection, each `(type, sdp)`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDescriptions {
+  pub current_local: Option<(String, String)>,
+  pub pending_local: Option<(String, String)>,
+  pub current_remote: Option<(String, String)>,
+  pub pending_remote: Option<(String, String)>,
+}
+
+pub struct Peer {
+  pub core: RefCell<Core>,
+  guard: Rc<dyn NetGuard>,
+  /// Ops -> driver: there is something to flush.
+  wake: Notify,
+  /// Driver -> `op_webrtc_pc_next_events`: `core.events` is not empty.
+  events_ready: Notify,
+  cancel: Rc<CancelHandle>,
+  closed: Cell<bool>,
+  driver_started: Cell<bool>,
+}
+
+pub(crate) fn rtc_err(e: impl std::fmt::Display) -> WebRtcError {
+  WebRtcError::Operation(e.to_string())
+}
+
+/// The largest session description handed to the engine, in bytes (the
+/// engine's own `MAX_SDP_SIZE`, 1 MiB).
+pub(crate) const MAX_SDP_BYTES: usize = 1 << 20;
+
+/// Refuses an offer, answer or pranswer longer than [`MAX_SDP_BYTES`] before
+/// anything reads it, with the OperationError a description the engine can't
+/// parse gets. A rollback's text is ignored, and an unknown type stays the
+/// TypeError `description` reports.
+pub(crate) fn check_sdp_size(kind: &str, sdp: &str) -> Result<(), WebRtcError> {
+  if matches!(kind, "offer" | "answer" | "pranswer")
+    && sdp.len() > MAX_SDP_BYTES
+  {
+    return Err(WebRtcError::Operation(format!(
+      "session description of {} bytes exceeds {MAX_SDP_BYTES}",
+      sdp.len()
+    )));
+  }
+  Ok(())
+}
+
+/// Whether an SDP has an m-section that isn't rejected: port zero without
+/// `a=bundle-only` is a rejected one (RFC 8843 §6).
+pub(crate) fn has_live_media_section(sdp: &str) -> bool {
+  sdp.split("\nm=").skip(1).any(|section| {
+    let port = section.split_ascii_whitespace().nth(1);
+    port != Some("0") || section.contains("a=bundle-only")
+  })
+}
+
+/// An engine error applying a description: a type the signaling state
+/// doesn't take (RFC 9429 §5.5 / §5.6) is an InvalidStateError (W3C "set the
+/// RTCSessionDescription", step 4); anything else an OperationError.
+fn description_err(e: RtcError) -> WebRtcError {
+  match e {
+    RtcError::ErrSignalingStateCannotRollback
+    | RtcError::ErrSignalingStateProposedTransitionInvalid(_) => {
+      WebRtcError::InvalidState(e.to_string())
+    }
+    // A description the engine can't apply as written (the legacy
+    // InvalidAccessError browsers and the WPT keep).
+    RtcError::ErrSessionDescriptionInvalidIceCredentials => {
+      WebRtcError::InvalidAccess(e.to_string())
+    }
+    e => rtc_err(e),
+  }
+}
+
+/// The candidate's transport, address and port, from a candidate attribute
+/// value (`candidate:<foundation> <component> <transport> <priority>
+/// <address> <port> typ ...`).
+pub fn candidate_address(candidate: &str) -> Option<(String, String, u16)> {
+  let value = candidate
+    .trim()
+    .strip_prefix("a=")
+    .unwrap_or(candidate.trim());
+  let value = value.strip_prefix("candidate:").unwrap_or(value);
+  let mut fields = value.split_ascii_whitespace();
+  let _foundation = fields.next()?;
+  let _component = fields.next()?;
+  let transport = fields.next()?.to_ascii_lowercase();
+  let _priority = fields.next()?;
+  let address = fields.next()?.to_string();
+  let port = fields.next()?.parse().ok()?;
+  Some((transport, address, port))
+}
+
+/// What to do with a remote candidate before the engine sees it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RemoteCandidate {
+  /// A UDP candidate with a literal address: check it, then add it.
+  Udp(SocketAddr),
+  /// A passive (or simultaneous-open) TCP candidate with a literal address,
+  /// on a connection doing ICE over TCP: check it, then add it.
+  Tcp(SocketAddr),
+  /// An mDNS `.local` host candidate, on a connection that resolves them:
+  /// the engine resolves it, and the address it resolves to is checked
+  /// against the net permission before anything is sent there.
+  Mdns,
+  /// Skipped and reported as accepted, as a browser does with a candidate it
+  /// cannot use: TCP candidates without ICE over TCP (a `tcpPort` network),
+  /// active TCP candidates (they have no port; the peer is reached on our
+  /// passive candidate), and `.local` names when mDNS is off (such a peer
+  /// is still reached as a peer-reflexive candidate once its checks arrive).
+  Ignore,
+}
+
+/// The `tcptype` of a candidate attribute value, if it has one.
+fn candidate_tcp_type(candidate: &str) -> Option<TcpType> {
+  let mut fields = candidate.split_ascii_whitespace();
+  while let Some(field) = fields.next() {
+    if field.eq_ignore_ascii_case("tcptype") {
+      return fields
+        .next()
+        .map(|t| TcpType::from(t.to_ascii_lowercase().as_str()));
+    }
+  }
+  None
+}
+
+/// Classifies a remote candidate for a connection that does (`tcp`) or
+/// doesn't do ICE over TCP, and does (`mdns`) or doesn't resolve `.local`
+/// names.
+pub fn classify_remote_candidate(
+  candidate: &str,
+  tcp: bool,
+  mdns: bool,
+) -> Result<RemoteCandidate, WebRtcError> {
+  let Some((transport, address, port)) = candidate_address(candidate) else {
+    return Err(WebRtcError::Operation(format!(
+      "Invalid ICE candidate '{candidate}'"
+    )));
+  };
+  let is_tcp = match transport.as_str() {
+    "udp" => false,
+    "tcp" if tcp => true,
+    _ => return Ok(RemoteCandidate::Ignore),
+  };
+  if is_tcp
+    && !matches!(
+      candidate_tcp_type(candidate),
+      Some(TcpType::Passive | TcpType::SimultaneousOpen)
+    )
+  {
+    return Ok(RemoteCandidate::Ignore);
+  }
+  match address.trim_matches(['[', ']']).parse::<IpAddr>() {
+    Ok(ip) if is_tcp => Ok(RemoteCandidate::Tcp(SocketAddr::new(ip, port))),
+    Ok(ip) => Ok(RemoteCandidate::Udp(SocketAddr::new(ip, port))),
+    Err(_) if mdns && is_mdns_name(&address) => Ok(RemoteCandidate::Mdns),
+    Err(_) => Ok(RemoteCandidate::Ignore),
+  }
+}
+
+/// A host candidate's `<name>.local` address (RFC 6762 names; WebRTC's are
+/// `<uuid>.local`).
+fn is_mdns_name(address: &str) -> bool {
+  let lower = address.to_ascii_lowercase();
+  let Some(label) = lower.strip_suffix(".local") else {
+    return false;
+  };
+  !label.is_empty()
+    && label.len() <= 63
+    && label
+      .bytes()
+      .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Whether this connection can use mDNS at all: never with
+/// `DENO_WEBRTC_LOOPBACK_ONLY=1`, and only with the permissions the socket
+/// needs (listening on the wildcard address, sending to the mDNS group) and
+/// interface enumeration, without which the connection is on loopback and
+/// can't reach a LAN address anyway.
+fn mdns_permitted(guard: &dyn NetGuard) -> Result<(), String> {
+  if loopback_only() {
+    return Err("DENO_WEBRTC_LOOPBACK_ONLY=1".to_string());
+  }
+  guard.interfaces()?;
+  guard.listen(IpAddr::V4(Ipv4Addr::UNSPECIFIED))?;
+  guard.connect(MDNS_DEST_ADDR)
+}
+
+/// The mDNS socket: port 5353 on every IPv4 interface, shared with the
+/// host's own responder (address reuse), in the mDNS group.
+fn bind_mdns(hosts: &[IpAddr]) -> std::io::Result<UdpSocket> {
+  let mdns_addr = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), MDNS_PORT);
+  let socket = socket2::Socket::new(
+    socket2::Domain::IPV4,
+    socket2::Type::DGRAM,
+    Some(socket2::Protocol::UDP),
+  )?;
+  socket.set_reuse_address(true)?;
+  #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+  socket.set_reuse_port(true)?;
+  socket.set_nonblocking(true)?;
+  socket.set_multicast_ttl_v4(255)?;
+  socket.set_multicast_loop_v4(true)?;
+  socket.bind(&mdns_addr.into())?;
+  let group = rtc::mdns::MDNS_MULTICAST_IPV4;
+  let mut joined = false;
+  for ip in hosts {
+    if let IpAddr::V4(iface) = ip
+      && !iface.is_loopback()
+      && socket.join_multicast_v4(&group, iface).is_ok()
+    {
+      joined = true;
+    }
+  }
+  if !joined {
+    socket.join_multicast_v4(&group, &Ipv4Addr::UNSPECIFIED)?;
+  }
+  UdpSocket::from_std(socket.into())
+}
+
+/// Hides the base address a server-reflexive or relay candidate names
+/// (`raddr` / `rport`) when the host candidates are published under mDNS
+/// names, as browsers do: it is the host address the name stands for.
+pub(crate) fn redact_related_address(candidate: &str) -> String {
+  let mut out = Vec::new();
+  let mut fields = candidate.split(' ');
+  while let Some(field) = fields.next() {
+    out.push(field.to_string());
+    let hidden = match field {
+      "raddr" => fields
+        .next()
+        .map(|addr| if addr.contains(':') { "::" } else { "0.0.0.0" }),
+      "rport" => fields.next().map(|_| "0"),
+      _ => None,
+    };
+    if let Some(value) = hidden {
+      out.push(value.to_string());
+    }
+  }
+  out.join(" ")
+}
+
+/// `DENO_WEBRTC_LOOPBACK_ONLY=1`: gather on `127.0.0.1` alone, never binding
+/// the wildcard address (test machines whose firewall asks about every
+/// non-loopback listener; two peers on one machine still connect). Read by
+/// the runtime like its other `DENO_*` switches, without `--allow-env`.
+pub(crate) fn loopback_only() -> bool {
+  std::env::var_os("DENO_WEBRTC_LOOPBACK_ONLY").is_some_and(|v| v == "1")
+}
+
+/// The machine's usable interface addresses (no loopback, no link-local),
+/// of the named interfaces only when `names` is given.
+pub(crate) fn interface_addresses(names: Option<&[String]>) -> Vec<IpAddr> {
+  let Ok(ifaces) = netif::up() else {
+    return Vec::new();
+  };
+  let mut out = Vec::new();
+  for iface in ifaces {
+    if names.is_some_and(|names| !names.iter().any(|n| n == iface.name())) {
+      continue;
+    }
+    let ip = *iface.address();
+    let usable = match ip {
+      IpAddr::V4(v4) => {
+        !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified()
+      }
+      IpAddr::V6(v6) => {
+        // Link-local addresses need a scope id the candidate grammar can't
+        // carry; IPv4-mapped ones duplicate the IPv4 candidate.
+        !v6.is_loopback()
+          && !v6.is_unspecified()
+          && (v6.segments()[0] & 0xffc0) != 0xfe80
+          && v6.to_ipv4_mapped().is_none()
+      }
+    };
+    if usable && !out.contains(&ip) {
+      out.push(ip);
+    }
+  }
+  out
+}
+
+/// Binds a UDP socket (an IPv6 one IPv6-only, so the two families stay
+/// apart).
+pub(crate) fn bind_udp(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+  let domain = if addr.is_ipv4() {
+    socket2::Domain::IPV4
+  } else {
+    socket2::Domain::IPV6
+  };
+  let socket = socket2::Socket::new(
+    domain,
+    socket2::Type::DGRAM,
+    Some(socket2::Protocol::UDP),
+  )?;
+  if addr.is_ipv6() {
+    socket.set_only_v6(true)?;
+  }
+  socket.set_nonblocking(true)?;
+  socket.bind(&addr.into())?;
+  UdpSocket::from_std(socket.into())
+}
+
+/// The local IP the OS sends to `peer` from: a connected UDP probe (no
+/// datagram leaves the machine).
+fn route_to(peer: IpAddr) -> Option<IpAddr> {
+  let unspecified: IpAddr = if peer.is_ipv4() {
+    Ipv4Addr::UNSPECIFIED.into()
+  } else {
+    Ipv6Addr::UNSPECIFIED.into()
+  };
+  let probe = std::net::UdpSocket::bind((unspecified, 0)).ok()?;
+  probe.connect((peer, 9)).ok()?;
+  Some(probe.local_addr().ok()?.ip())
+}
+
+/// RFC 7983 demultiplexing: a STUN message starts with 0-3.
+fn is_stun(data: &[u8]) -> bool {
+  data.first().is_some_and(|b| *b < 4)
+}
+
+fn candidate_line(
+  candidate: rtc::shared::error::Result<rtc::ice::candidate::Candidate>,
+) -> Result<String, WebRtcError> {
+  let candidate = candidate.map_err(rtc_err)?;
+  Ok(
+    RTCIceCandidate::from(&candidate)
+      .to_json()
+      .map_err(rtc_err)?
+      .candidate,
+  )
+}
+
+fn base_config(addr: SocketAddr) -> CandidateConfig {
+  CandidateConfig {
+    network: "udp".to_owned(),
+    address: addr.ip().to_string(),
+    port: addr.port(),
+    component: 1,
+    ..Default::default()
+  }
+}
+
+/// An ICE-TCP host candidate's line.
+fn tcp_host_line(
+  addr: SocketAddr,
+  tcp_type: TcpType,
+) -> Result<String, WebRtcError> {
+  candidate_line(
+    CandidateHostConfig {
+      base_config: CandidateConfig {
+        network: "tcp".to_owned(),
+        ..base_config(addr)
+      },
+      tcp_type,
+    }
+    .new_candidate_host(),
+  )
+}
+
+/// The length of the first complete RFC 6544 frame in `buf` (a STUN message
+/// or a padded ChannelData message), `Some(0)` for an incomplete one, `None`
+/// for garbage.
+fn stream_frame_len(buf: &[u8]) -> Option<usize> {
+  if buf.len() < 4 {
+    return Some(0);
+  }
+  let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+  let total = match buf[0] >> 6 {
+    0 => 20 + len,
+    1 => 4 + len.div_ceil(4) * 4,
+    _ => return None,
+  };
+  if total > MAX_STREAM_FRAME {
+    return None;
+  }
+  Some(if buf.len() >= total { total } else { 0 })
+}
+
+impl Core {
+  /// The local description's first media section id, for candidates the
+  /// engine reports without one (W3C: `sdpMid` of the bundled section).
+  fn first_mid(&self) -> Option<String> {
+    let desc = self.pc.local_description()?;
+    desc.sdp.lines().find_map(|l| {
+      l.trim_end()
+        .strip_prefix("a=mid:")
+        .map(|mid| mid.trim().to_string())
+    })
+  }
+
+  fn local_ufrag(&self) -> Option<String> {
+    let desc = self.pc.local_description()?;
+    desc.sdp.lines().find_map(|l| {
+      l.trim_end()
+        .strip_prefix("a=ice-ufrag:")
+        .map(|u| u.trim().to_string())
+    })
+  }
+
+  fn add_local(
+    &mut self,
+    candidate: String,
+    url: Option<String>,
+  ) -> Result<(), WebRtcError> {
+    self
+      .pc
+      .add_local_candidate(RTCIceCandidateInit {
+        candidate,
+        url,
+        ..Default::default()
+      })
+      .map_err(rtc_err)?;
+    self.local_gathered += 1;
+    Ok(())
+  }
+
+  fn remote_ufrag(&self) -> Option<String> {
+    let desc = self.pc.remote_description()?;
+    desc.sdp.lines().find_map(|l| {
+      l.trim_end()
+        .strip_prefix("a=ice-ufrag:")
+        .map(|u| u.trim().to_string())
+    })
+  }
+
+  /// W3C `RTCSctpTransport.state`: `connecting` until the association is
+  /// up, `connected`, then `closed` for good once it ends (the engine forgets
+  /// a closed association, so anything after `connected` is `closed`).
+  fn track_sctp_state(&mut self) {
+    let Some(engine) = self.pc.sctp().map(|s| s.state()) else {
+      return;
+    };
+    let next = match (self.sctp_state, engine) {
+      ("closed", _) => "closed",
+      (_, RTCSctpTransportState::Connected) => "connected",
+      ("connected", _) | (_, RTCSctpTransportState::Closed) => "closed",
+      _ => "connecting",
+    };
+    if next != self.sctp_state {
+      self.sctp_state = next;
+      self.events.push_back(JsEvent::SctpState { state: next });
+    }
+  }
+
+  /// Reports what each channel's SCTP stream has sent since the last pass.
+  fn track_sent(&mut self) {
+    let handles: Vec<u32> = self.sent.keys().copied().collect();
+    for handle in handles {
+      let Some(now) = self
+        .pc
+        .data_channel(handle as RTCDataChannelId)
+        .map(|c| c.bytes_dequeued())
+      else {
+        self.sent.remove(&handle);
+        continue;
+      };
+      let last = self.sent.insert(handle, now).unwrap_or(0);
+      if now > last {
+        self.events.push_back(JsEvent::DataChannelSent {
+          channel: handle,
+          bytes: (now - last) as f64,
+        });
+      }
+    }
+  }
+
+  /// The DTLS transport's state: reached through the SCTP transport, else
+  /// through a receiver (all of them share the one bundled transport).
+  fn track_dtls_state(&mut self) {
+    let state = match self.pc.sctp() {
+      Some(sctp) => Some(sctp.transport().state()),
+      None => {
+        let receivers: Vec<_> = self.pc.get_receivers().collect();
+        receivers.into_iter().find_map(|id| {
+          self
+            .pc
+            .rtp_receiver(id)
+            .and_then(|r| r.transport().map(|t| t.state()))
+        })
+      }
+    };
+    let Some(state) = state.map(|s| s.to_string()) else {
+      return;
+    };
+    if state != self.dtls_state {
+      self.dtls_state.clone_from(&state);
+      self.events.push_back(JsEvent::DtlsState { state });
+    }
+  }
+
+  /// The engine's ICE transport's selected pair, reached through the SCTP
+  /// transport, else through a receiver or a sender (all of them share the one
+  /// bundled transport; a receiver or sender has one once it has a mid).
+  fn ice_selected_pair(&mut self) -> Option<SelectedPair> {
+    let to_pair =
+      |p: rtc::peer_connection::transport::RTCIceCandidatePair| SelectedPair {
+        local: PairCandidate::of(p.local()),
+        remote: PairCandidate::of(p.remote()),
+      };
+    if let Some(sctp) = self.pc.sctp() {
+      return sctp
+        .transport()
+        .ice_transport()
+        .get_selected_candidate_pair()
+        .map(to_pair);
+    }
+    let receivers: Vec<_> = self.pc.get_receivers().collect();
+    for id in receivers {
+      let pair = self.pc.rtp_receiver(id).and_then(|r| {
+        r.transport()
+          .map(|t| t.ice_transport().get_selected_candidate_pair())
+      });
+      match pair {
+        Some(pair) => return pair.map(to_pair),
+        None => continue,
+      }
+    }
+    let senders: Vec<_> = self.pc.get_senders().collect();
+    for id in senders {
+      let pair = self.pc.rtp_sender(id).and_then(|s| {
+        s.transport()
+          .map(|t| t.ice_transport().get_selected_candidate_pair())
+      });
+      match pair {
+        Some(pair) => return pair.map(to_pair),
+        None => continue,
+      }
+    }
+    None
+  }
+
+  /// RFC 8445 section 8.1.2 / RFC 8838 section 8: with gathering complete
+  /// on both sides, a check list that has no pair at all (no local
+  /// candidate, under a relay-only policy without a TURN server, or no
+  /// remote one) can never succeed, so ICE is `failed` rather than left
+  /// `checking` until the timeout.
+  fn fail_without_pairs(&mut self) {
+    if self.failed
+      || self.gathering != GatherPhase::Complete
+      || !self.remote_gathered
+      || self.pc.remote_description().is_none()
+    {
+      return;
+    }
+    if self.local_gathered == 0 {
+      self.fail("no local candidates, and gathering is complete");
+    } else if !self.remote_known {
+      self.fail("the remote side signalled no candidates");
+    }
+  }
+
+  fn report_error(
+    &mut self,
+    url: &str,
+    base: Option<SocketAddr>,
+    error_code: u16,
+    error_text: String,
+  ) {
+    self.events.push_back(JsEvent::IceCandidateError {
+      address: base.map(|b| b.ip().to_string()),
+      port: base.map(|b| b.port()),
+      url: url.to_string(),
+      error_code,
+      error_text,
+    });
+  }
+
+  /// Reports `failed` on the engine's behalf (watchdog, panic).
+  fn fail(&mut self, why: &str) {
+    if self.failed {
+      return;
+    }
+    log::debug!("webrtc: connection failed: {why}");
+    self.failed = true;
+    self.events.push_back(JsEvent::IceConnectionState {
+      state: "failed".to_string(),
+    });
+    self.events.push_back(JsEvent::ConnectionState {
+      state: "failed".to_string(),
+    });
+  }
+
+  /// The send-side permission gate: once per destination address.
+  fn permit(&mut self, guard: &dyn NetGuard, addr: SocketAddr) -> bool {
+    if self.allowed.contains(&addr) {
+      return true;
+    }
+    if self.refused.contains(&addr) {
+      return false;
+    }
+    match guard.connect(addr) {
+      Ok(()) => {
+        self.allowed.insert(addr);
+        true
+      }
+      Err(message) => {
+        self.refused.insert(addr);
+        self.events.push_back(JsEvent::IceCandidateError {
+          address: Some(addr.ip().to_string()),
+          port: Some(addr.port()),
+          url: String::new(),
+          error_code: ERROR_CODE_UNREACHABLE,
+          error_text: message,
+        });
+        false
+      }
+    }
+  }
+
+  /// Marks a remote address as already checked (by `addIceCandidate` /
+  /// `setRemoteDescription`, which reject when it is refused).
+  pub(crate) fn mark_allowed(&mut self, addr: SocketAddr) {
+    self.allowed.insert(addr);
+    self.remote_known = true;
+  }
+
+  /// The UDP socket a datagram from `local` (a host candidate address or a
+  /// base) goes out on.
+  fn endpoint_for(&self, local: SocketAddr) -> Option<Rc<EcnUdpSocket>> {
+    self
+      .endpoints
+      .iter()
+      .find(|e| {
+        e.bound.port() == local.port() && e.bound.is_ipv4() == local.is_ipv4()
+      })
+      .map(|e| e.socket.clone())
+  }
+
+  /// The local address a datagram on `endpoint` from `from` arrived on.
+  /// The OS route is probed and cached only for an address ICE or the
+  /// permission gate vouched for ([`Core::is_known_remote`]).
+  fn local_for(&mut self, endpoint: usize, from: SocketAddr) -> SocketAddr {
+    let known = self.is_known_remote(from.ip());
+    self.local_address(endpoint, from, known)
+  }
+
+  /// Whether `ip` is a remote address ICE or the permission gate vouched for:
+  /// a signalled remote candidate, a STUN/TURN server, a destination the
+  /// engine sent to (which it does only for a signalled candidate or after
+  /// authenticating a check), or the selected pair's.
+  fn is_known_remote(&self, ip: IpAddr) -> bool {
+    self.selected.is_some_and(|(_, r)| r.ip() == ip)
+      || self.allowed.iter().any(|a| a.ip() == ip)
+  }
+
+  /// [`Core::local_for`] with the trust decided by the caller. With `probe`,
+  /// the OS route to `from` (a connected probe socket) is resolved and
+  /// cached. Without it the first host address stands in and nothing is
+  /// opened or kept, so a datagram from an address nobody vouched for costs
+  /// neither a socket nor memory.
+  fn local_address(
+    &mut self,
+    endpoint: usize,
+    from: SocketAddr,
+    probe: bool,
+  ) -> SocketAddr {
+    let e = &self.endpoints[endpoint];
+    let port = e.bound.port();
+    let ip = if !e.bound.ip().is_unspecified() {
+      e.bound.ip()
+    } else if let Some(ip) = self.routes.get(&from.ip()) {
+      *ip
+    } else if !probe || e.hosts.len() <= 1 {
+      // With one host address (or none) a probe could give no other answer.
+      e.hosts.first().copied().unwrap_or(from.ip())
+    } else {
+      let ip = route_to(from.ip())
+        .filter(|ip| e.hosts.contains(ip))
+        .or_else(|| e.hosts.first().copied())
+        .unwrap_or(from.ip());
+      // A cache: once full it starts over rather than grow.
+      if self.routes.len() >= MAX_ROUTES {
+        self.routes.clear();
+      }
+      self.routes.insert(from.ip(), ip);
+      ip
+    };
+    // 1:1 NAT in host mode: the host candidate is the public address (unless
+    // the engine maps it, keeping the private socket as the base).
+    let ip = match self.options.network.as_ref().map(|n| &n.options) {
+      Some(net) if !net.public_srflx && !self.engine_nat => {
+        net.public_for(ip).unwrap_or(ip)
+      }
+      _ => ip,
+    };
+    SocketAddr::new(ip, port)
+  }
+
+  /// Whether a non-STUN packet on (`local`, `from`) belongs to the selected
+  /// pair. The engine sends DTLS (and everything inside it) only on the
+  /// selected pair, so the pair is the one its last non-STUN datagram went
+  /// out on. Until it has sent one (the DTLS server waiting for the client's
+  /// first flight), a packet is accepted only while ICE is connected and only
+  /// from an address ICE has exchanged STUN with. The local side is compared
+  /// by family and port (exactly for a relay): a wildcard socket's local
+  /// address is the routed one.
+  fn is_from_selected_pair(
+    &self,
+    local: SocketAddr,
+    from: SocketAddr,
+    relayed: bool,
+  ) -> bool {
+    match self.selected {
+      Some(_) if self.selected_tcp => false,
+      Some((l, r)) => {
+        r == from
+          && if relayed {
+            l == local
+          } else {
+            l.port() == local.port() && l.is_ipv4() == local.is_ipv4()
+          }
+      }
+      None => self.ice_up && self.stun_peers.contains(&from),
+    }
+  }
+
+  /// Remembers a remote address that sent STUN (bounded: a flood of
+  /// spoofed sources can't grow it without limit).
+  fn saw_stun(&mut self, from: SocketAddr) {
+    self.remote_known = true;
+    if self.stun_peers.len() < MAX_STUN_PEERS {
+      self.stun_peers.insert(from);
+    }
+  }
+
+  /// ICE over TCP (a `tcpPort` network): a passive candidate on each of the
+  /// network's listeners per host address, and an active one (port 9) per
+  /// host address, which dials the peer's passive candidates.
+  /// Signals the host (and 1:1 NAT server-reflexive) candidates of one UDP
+  /// endpoint, unless the policy is relay-only; `advertised` keeps an address
+  /// shared by two endpoints from being signalled twice.
+  fn announce_udp_hosts(
+    &mut self,
+    opts: &NetworkOptions,
+    bound: SocketAddr,
+    hosts: &[IpAddr],
+    gather_names: bool,
+    advertised: &mut HashSet<SocketAddr>,
+  ) {
+    if !self.options.relay_only {
+      for ip in &published_hosts(hosts, gather_names) {
+        let private = SocketAddr::new(*ip, bound.port());
+        let public = opts
+          .public_for(*ip)
+          .map(|p| SocketAddr::new(p, bound.port()));
+        let (host, srflx) = match public {
+          Some(p) if opts.public_srflx => (private, Some(p)),
+          // The engine announces it on the public address.
+          Some(_) if self.engine_nat => (private, None),
+          Some(p) => (p, None),
+          None => (private, None),
+        };
+        if advertised.insert(host) {
+          let line = candidate_line(
+            CandidateHostConfig {
+              base_config: base_config(host),
+              ..Default::default()
+            }
+            .new_candidate_host(),
+          );
+          if let Err(e) = line.and_then(|line| self.add_local(line, None)) {
+            self.report_error(
+              "",
+              Some(host),
+              ERROR_CODE_UNREACHABLE,
+              e.to_string(),
+            );
+          }
+        }
+        if let Some(srflx) = srflx
+          && advertised.insert(srflx)
+        {
+          let line = candidate_line(
+            CandidateServerReflexiveConfig {
+              base_config: base_config(srflx),
+              rel_addr: private.ip().to_string(),
+              rel_port: private.port(),
+              url: None,
+            }
+            .new_candidate_server_reflexive(),
+          );
+          if let Err(e) = line.and_then(|line| self.add_local(line, None)) {
+            self.report_error(
+              "",
+              Some(srflx),
+              ERROR_CODE_UNREACHABLE,
+              e.to_string(),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  /// What candidates are gathered on: the network's options, or loopback
+  /// included by default.
+  fn gather_options(&self) -> NetworkOptions {
+    match self.options.network.as_ref() {
+      Some(n) => n.options.clone(),
+      None => NetworkOptions {
+        include_loopback: true,
+        ..Default::default()
+      },
+    }
+  }
+
+  fn gather_tcp(&mut self, opts: &NetworkOptions, gather_names: bool) {
+    let Some(net) = self.options.network.clone().filter(|n| n.has_tcp()) else {
+      return;
+    };
+    let mut lines: Vec<(SocketAddr, TcpType)> = Vec::new();
+    let mut active: Vec<IpAddr> = Vec::new();
+    for endpoint in &net.tcp {
+      for ip in published_hosts(&endpoint.hosts, gather_names) {
+        // 1:1 NAT: the public address in place of the private one (host
+        // mode), as for UDP; in srflx mode, or when the engine maps it, the
+        // host address itself.
+        let advertised = match opts.public_for(ip) {
+          Some(public) if !opts.public_srflx && !self.engine_nat => public,
+          _ => ip,
+        };
+        let passive = SocketAddr::new(advertised, endpoint.bound.port());
+        if !lines.contains(&(passive, TcpType::Passive)) {
+          lines.push((passive, TcpType::Passive));
+        }
+        if !active.contains(&advertised) {
+          active.push(advertised);
+        }
+      }
+    }
+    for ip in active {
+      lines.push((SocketAddr::new(ip, ACTIVE_TCP_PORT), TcpType::Active));
+    }
+    for (addr, tcp_type) in lines {
+      if let Err(e) = tcp_host_line(addr, tcp_type)
+        .and_then(|line| self.add_local(line, None))
+      {
+        self.report_error(
+          "",
+          Some(addr),
+          ERROR_CODE_UNREACHABLE,
+          e.to_string(),
+        );
+      }
+    }
+  }
+
+  /// Sends an ICE-TCP frame: on the connection to `to`, or, from an active
+  /// candidate, by dialling `to` (a remote passive candidate) first. A
+  /// passive candidate only answers on connections it accepted.
+  fn send_tcp(&mut self, local: SocketAddr, to: SocketAddr, data: &[u8]) {
+    let Some(frame) = try_frame_packet(data) else {
+      return;
+    };
+    if let Some(link) = self.tcp_links.get(&to) {
+      if link.writer.try_send(frame).is_err() {
+        log::debug!("webrtc: ICE-TCP queue to {to} is full");
+      }
+      return;
+    }
+    if local.port() != ACTIVE_TCP_PORT {
+      return;
+    }
+    if let Some(queue) = self.tcp_dialing.get_mut(&to) {
+      if queue.len() < MAX_DIAL_QUEUE {
+        queue.push(frame);
+      }
+      return;
+    }
+    if self.tcp_links.len() + self.tcp_dialing.len() >= MAX_TCP_LINKS {
+      return;
+    }
+    self.tcp_dialing.insert(to, vec![frame]);
+    let bind = self.tcp_bind_ip(local.ip());
+    if let Some(peer) = self.this.upgrade() {
+      let cancel = peer.cancel.clone();
+      let weak = self.this.clone();
+      deno_core::unsync::spawn(
+        async move {
+          let stream =
+            tokio::time::timeout(TCP_CONNECT_TIMEOUT, connect_tcp(bind, to))
+              .await;
+          let Some(peer) = weak.upgrade() else {
+            return;
+          };
+          match stream {
+            Ok(Ok(stream)) => {
+              peer.attach_tcp(stream, to, TcpFrameDecoder::new(), None)
+            }
+            Ok(Err(e)) => {
+              log::debug!("webrtc: ICE-TCP connect to {to}: {e}");
+              peer.core.borrow_mut().tcp_dialing.remove(&to);
+            }
+            Err(_) => {
+              log::debug!("webrtc: ICE-TCP connect to {to} timed out");
+              peer.core.borrow_mut().tcp_dialing.remove(&to);
+            }
+          }
+        }
+        .or_cancel(cancel),
+      );
+    }
+  }
+
+  /// The local address an outbound ICE-TCP connection binds for an active
+  /// candidate on `ip`: that host address itself (a public one in 1:1 NAT
+  /// host mode stands for its private address), or none (the OS picks).
+  fn tcp_bind_ip(&self, ip: IpAddr) -> Option<IpAddr> {
+    let net = self.options.network.as_ref()?;
+    let hosts: Vec<IpAddr> = net
+      .tcp
+      .iter()
+      .flat_map(|e| e.hosts.iter().copied())
+      .collect();
+    if hosts.contains(&ip) {
+      return Some(ip);
+    }
+    net
+      .options
+      .private_for(ip, &hosts)
+      .filter(|private| hosts.contains(private))
+  }
+
+  /// The local address the engine knows an ICE-TCP connection's local
+  /// address by: in 1:1 NAT host mode the public address stands for the
+  /// private one, as for UDP.
+  fn tcp_local(&self, local: SocketAddr) -> SocketAddr {
+    match self.options.network.as_ref().map(|n| &n.options) {
+      Some(net) if !net.public_srflx && !self.engine_nat => SocketAddr::new(
+        net.public_for(local.ip()).unwrap_or(local.ip()),
+        local.port(),
+      ),
+      _ => local,
+    }
+  }
+
+  /// Opens the mDNS socket once (on first need): `false` when it can't be.
+  fn open_mdns(&mut self) -> bool {
+    if self.mdns_socket.is_some() {
+      return true;
+    }
+    if self.mdns_failed || self.mdns_mode == MdnsMode::Off {
+      return false;
+    }
+    let hosts = if self.endpoints.is_empty() {
+      interface_addresses(
+        self
+          .options
+          .network
+          .as_ref()
+          .and_then(|n| n.options.interfaces.as_deref()),
+      )
+    } else {
+      self
+        .endpoints
+        .iter()
+        .flat_map(|e| e.hosts.clone())
+        .collect()
+    };
+    let socket = match bind_mdns(&hosts) {
+      Ok(socket) => Rc::new(EcnUdpSocket::plain(socket)),
+      Err(e) => {
+        self.mdns_failed = true;
+        self.report_error(
+          "",
+          None,
+          ERROR_CODE_UNREACHABLE,
+          format!("mDNS is unavailable: {e}"),
+        );
+        return false;
+      }
+    };
+    if let Some(peer) = self.this.upgrade() {
+      spawn_udp_reader_via(
+        socket.clone(),
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), MDNS_PORT),
+        self.recv_tx.clone(),
+        peer.cancel.clone(),
+        Via::Mdns,
+      );
+    }
+    self.mdns_socket = Some(socket);
+    true
+  }
+
+  /// Whether a remote `.local` candidate can be resolved here (opening the
+  /// mDNS socket if it isn't yet).
+  fn resolves_mdns(&mut self) -> bool {
+    self.mdns_mode != MdnsMode::Off && self.open_mdns()
+  }
+
+  /// Whether this connection does ICE over TCP (a `tcpPort` network).
+  fn ice_tcp(&self) -> bool {
+    self.options.network.as_ref().is_some_and(|n| n.has_tcp())
+  }
+
+  /// A candidate line as JavaScript sees it: with the host candidates
+  /// published under mDNS names, the base address a server-reflexive or
+  /// relay candidate names is hidden too.
+  fn public_candidate(&self, line: String) -> String {
+    if self.mdns_mode == MdnsMode::Gather && line.contains(" raddr ") {
+      redact_related_address(&line)
+    } else {
+      line
+    }
+  }
+
+  /// Sends what the engine wants sent, through the socket or a TURN relay.
+  fn flush_engine_writes(&mut self, guard: &dyn NetGuard) -> bool {
+    let mut progressed = false;
+    while let Some(msg) = self.pc.poll_write() {
+      progressed = true;
+      let local = msg.transport.local_addr;
+      let to = msg.transport.peer_addr;
+      // mDNS queries and answers (permitted when the socket was opened).
+      if to == MDNS_DEST_ADDR {
+        if let Some(socket) = &self.mdns_socket
+          && let Err(e) = socket.try_send_to(&msg.message, to)
+        {
+          log::debug!("webrtc: mDNS send: {e}");
+        }
+        continue;
+      }
+      if !self.permit(guard, to) {
+        continue;
+      }
+      let tcp = msg.transport.transport_protocol == TransportProtocol::TCP;
+      if !is_stun(&msg.message) {
+        self.selected = Some((local, to));
+        self.selected_tcp = tcp;
+      }
+      if tcp {
+        self.send_tcp(local, to, &msg.message);
+        continue;
+      }
+      if let Some(server) =
+        self.servers.iter_mut().find(|s| s.relay == Some(local))
+      {
+        let now = Instant::now();
+        let sent = server
+          .client
+          .relay(local)
+          .and_then(|mut relay| relay.send_to(now, &msg.message, to));
+        if sent.is_err() {
+          // No permission for this peer on the relay yet: ask for it and
+          // drop the datagram (ICE retransmits its checks).
+          if let Ok(mut relay) = server.client.relay(local) {
+            let _ = relay.create_permission(now, to);
+          }
+        }
+        continue;
+      }
+      // The codepoint the engine chose (ECT(1) on the RTP of a stream
+      // that negotiated `ack ccfb`, with ECN on), per datagram.
+      if let Some(socket) = self.endpoint_for(local)
+        && let Err(e) =
+          socket.try_send_to_ecn(&msg.message, to, msg.transport.ecn)
+      {
+        log::debug!("webrtc: send {local} -> {to}: {e}");
+      }
+    }
+    progressed
+  }
+
+  /// Runs the STUN/TURN clients: their datagrams out, their results in.
+  fn service_servers(&mut self, now: Instant) -> bool {
+    let mut progressed = false;
+    let mut found: Vec<(String, SocketAddr, SocketAddr)> = Vec::new();
+    let mut relays: Vec<(String, SocketAddr, SocketAddr)> = Vec::new();
+    let mut errors: Vec<(String, SocketAddr, String)> = Vec::new();
+    let mut relayed_in: Vec<(SocketAddr, SocketAddr, BytesMut)> = Vec::new();
+    for server in &mut self.servers {
+      while let Some(tx) = server.client.poll_write() {
+        progressed = true;
+        match &server.link {
+          ServerLink::Stream(writer) => {
+            let _ = writer.send(tx.message.to_vec());
+          }
+          ServerLink::Udp => {
+            if let Some(net) =
+              self.options.network.as_ref().filter(|n| n.is_shared())
+            {
+              net.register_transaction(&tx.message, &self.this);
+            }
+            if let Some(e) = self.endpoints.iter().find(|e| {
+              e.bound.port() == tx.transport.local_addr.port()
+                && e.bound.is_ipv4() == tx.transport.local_addr.is_ipv4()
+            }) && let Err(err) =
+              e.socket.try_send_to(&tx.message, tx.transport.peer_addr)
+            {
+              log::debug!("webrtc: STUN/TURN send: {err}");
+            }
+          }
+        }
+      }
+      while let Some(event) = server.client.poll_event() {
+        progressed = true;
+        let url = server.url.clone();
+        match event {
+          TurnEvent::BindingResponse(tid, addr)
+            if server.binding == Some(tid) =>
+          {
+            server.binding = None;
+            if matches!(server.link, ServerLink::Udp) {
+              found.push((url, server.base, addr));
+            }
+          }
+          TurnEvent::BindingError(tid, e) if server.binding == Some(tid) => {
+            server.binding = None;
+            errors.push((url, server.base, e.to_string()));
+          }
+          TurnEvent::AllocateResponse(tid, relay)
+            if server.allocate == Some(tid) =>
+          {
+            server.allocate = None;
+            server.relay = Some(relay);
+            relays.push((url, server.base, relay));
+          }
+          TurnEvent::AllocateError(tid, e) if server.allocate == Some(tid) => {
+            server.allocate = None;
+            errors.push((url, server.base, e.to_string()));
+          }
+          TurnEvent::TransactionTimeout(tid) => {
+            if server.binding == Some(tid) {
+              server.binding = None;
+              errors.push((
+                url,
+                server.base,
+                "STUN binding request timed out".to_string(),
+              ));
+            } else if server.allocate == Some(tid) {
+              server.allocate = None;
+              errors.push((
+                url,
+                server.base,
+                "TURN allocate request timed out".to_string(),
+              ));
+            }
+          }
+          TurnEvent::DataIndicationOrChannelData(_, from, data) => {
+            if let Some(relay) = server.relay {
+              relayed_in.push((relay, from, data));
+            }
+          }
+          _ => {}
+        }
+      }
+    }
+    for (url, base, addr) in found {
+      let host = self
+        .endpoints
+        .iter()
+        .any(|e| e.bound.port() == addr.port() && e.hosts.contains(&addr.ip()));
+      if host || self.options.relay_only || !self.srflx_seen.insert(addr) {
+        continue;
+      }
+      let line = candidate_line(
+        CandidateServerReflexiveConfig {
+          base_config: base_config(addr),
+          rel_addr: base.ip().to_string(),
+          rel_port: base.port(),
+          url: Some(url.clone()),
+        }
+        .new_candidate_server_reflexive(),
+      );
+      if let Err(e) =
+        line.and_then(|line| self.add_local(line, Some(url.clone())))
+      {
+        self.report_error(
+          &url,
+          Some(base),
+          ERROR_CODE_UNREACHABLE,
+          e.to_string(),
+        );
+      }
+    }
+    for (url, base, relay) in relays {
+      let line = candidate_line(
+        CandidateRelayConfig {
+          base_config: base_config(relay),
+          rel_addr: base.ip().to_string(),
+          rel_port: base.port(),
+          url: Some(url.clone()),
+        }
+        .new_candidate_relay(),
+      );
+      if let Err(e) =
+        line.and_then(|line| self.add_local(line, Some(url.clone())))
+      {
+        self.report_error(
+          &url,
+          Some(base),
+          ERROR_CODE_UNREACHABLE,
+          e.to_string(),
+        );
+      }
+    }
+    for (url, base, text) in errors {
+      self.report_error(&url, Some(base), ERROR_CODE_UNREACHABLE, text);
+    }
+    for (relay, from, data) in relayed_in {
+      if self.refused.contains(&from) {
+        continue;
+      }
+      if is_stun(&data) {
+        self.saw_stun(from);
+      } else if !self.is_from_selected_pair(relay, from, true) {
+        continue;
+      }
+      let _ = self.pc.handle_read(TaggedBytesMut {
+        now,
+        transport: TransportContext {
+          local_addr: relay,
+          peer_addr: from,
+          ecn: None,
+          transport_protocol: TransportProtocol::UDP,
+        },
+        message: data,
+      });
+    }
+    progressed
+  }
+
+  /// Moves the engine's events and received messages to the JS queue.
+  pub(crate) fn collect_events(&mut self, now: Instant) {
+    if self.checking_held && self.remote_known {
+      self.checking_held = false;
+      if !self.failed {
+        self.checking_since = Some(now);
+        self.events.push_back(JsEvent::IceConnectionState {
+          state: "checking".to_string(),
+        });
+      }
+    }
+    let mut mid = None::<String>;
+    // A channel's closing, error and close come after the messages the engine
+    // delivered with them: the engine queues messages apart from events, and
+    // a close the peer started follows its data on the wire (RFC 8831
+    // section 6.7), so none of it may be dropped as arriving "after" close.
+    let mut closes = Vec::new();
+    while let Some(event) = self.pc.poll_event() {
+      match event {
+        RTCPeerConnectionEvent::OnNegotiationNeededEvent => {
+          self.events.push_back(JsEvent::NegotiationNeeded)
+        }
+        RTCPeerConnectionEvent::OnIceCandidateEvent(e) => {
+          if self.options.relay_only
+            && e.candidate.typ != RTCIceCandidateType::Relay
+          {
+            continue;
+          }
+          let Ok(init) = e.candidate.to_json() else {
+            continue;
+          };
+          if mid.is_none() {
+            mid = Some(self.first_mid().unwrap_or_else(|| "0".to_string()));
+          }
+          let ufrag = self.local_ufrag();
+          let candidate = self.public_candidate(init.candidate);
+          self.events.push_back(JsEvent::IceCandidate {
+            candidate,
+            sdp_mid: mid.clone(),
+            sdp_m_line_index: Some(0),
+            username_fragment: ufrag,
+            url: if e.url.is_empty() { None } else { Some(e.url) },
+          });
+        }
+        RTCPeerConnectionEvent::OnIceCandidateErrorEvent(e) => {
+          self.events.push_back(JsEvent::IceCandidateError {
+            address: Some(e.address.clone()).filter(|a| !a.is_empty()),
+            port: Some(e.port).filter(|p| *p != 0),
+            url: e.url.clone(),
+            error_code: e.error_code,
+            error_text: e.error_text.clone(),
+          })
+        }
+        RTCPeerConnectionEvent::OnSignalingStateChangeEvent(s) => {
+          self.events.push_back(JsEvent::SignalingState {
+            state: s.to_string(),
+          })
+        }
+        RTCPeerConnectionEvent::OnIceConnectionStateChangeEvent(s) => {
+          let state = s.to_string();
+          // An ICE restart on a connected transport keeps its selected pair
+          // (the engine's previous media path) until the new generation
+          // selects one, so the transport stays connected: W3C webrtc-pc
+          // 4.3.3 has `checking` only for a transport with no working pair.
+          // Its `checking` (and the connection's `connecting`) is not
+          // reported; a restart from `disconnected` or `failed` is.
+          if state == "checking" && self.ice_up {
+            self.restart_masked = true;
+            continue;
+          }
+          if state != "checking" {
+            self.restart_masked = false;
+          }
+          if state == "checking" && !self.remote_known {
+            self.checking_held = true;
+            continue;
+          }
+          self.checking_held = false;
+          if state == "connected" || state == "completed" {
+            self.ice_up = true;
+            if !self.dtls_connected && self.ice_up_at.is_none() {
+              self.ice_up_at = Some(now);
+            }
+          } else {
+            self.ice_up = false;
+            self.ice_up_at = None;
+          }
+          self.checking_since =
+            (state == "checking" && !self.failed).then_some(now);
+          if !self.failed || state == "closed" {
+            self.events.push_back(JsEvent::IceConnectionState { state });
+          }
+        }
+        RTCPeerConnectionEvent::OnIceGatheringStateChangeEvent(s) => {
+          self.events.push_back(JsEvent::IceGatheringState {
+            state: s.to_string(),
+          })
+        }
+        RTCPeerConnectionEvent::OnConnectionStateChangeEvent(s) => {
+          let state = s.to_string();
+          if state == "connecting" && self.restart_masked {
+            continue;
+          }
+          if state == "connected" {
+            self.dtls_connected = true;
+            self.ice_up_at = None;
+          }
+          if !self.failed || state == "closed" {
+            self.events.push_back(JsEvent::ConnectionState { state });
+          }
+        }
+        RTCPeerConnectionEvent::OnDataChannel(dc) => {
+          let event = match dc {
+            RTCDataChannelEvent::OnOpen(handle) => {
+              self.sent.entry(handle as u32).or_insert(0);
+              let Some(channel) = self.pc.data_channel(handle) else {
+                continue;
+              };
+              JsEvent::DataChannelOpen {
+                channel: handle as u32,
+                id: channel.stream_id(),
+                label: channel.label().to_string(),
+                protocol: channel.protocol().to_string(),
+                ordered: channel.ordered(),
+                max_packet_life_time: channel.max_packet_life_time(),
+                max_retransmits: channel.max_retransmits(),
+                negotiated: channel.negotiated(),
+                priority: channel.priority(),
+              }
+            }
+            RTCDataChannelEvent::OnClosing(handle) => {
+              JsEvent::DataChannelClosing {
+                channel: handle as u32,
+              }
+            }
+            RTCDataChannelEvent::OnClose(handle) => JsEvent::DataChannelClose {
+              channel: handle as u32,
+            },
+            RTCDataChannelEvent::OnError(handle) => JsEvent::DataChannelError {
+              channel: handle as u32,
+            },
+            // `bufferedamountlow` follows what is sent, not what is
+            // acknowledged (`track_sent`).
+            _ => continue,
+          };
+          if matches!(event, JsEvent::DataChannelOpen { .. }) {
+            self.events.push_back(event);
+          } else {
+            closes.push(event);
+          }
+        }
+        RTCPeerConnectionEvent::OnTrack(RTCTrackEvent::OnOpen(init)) => {
+          let index: usize = init.receiver_id.into();
+          if let Some(key) = self.key_for_receiver_index(index) {
+            self.media.track_keys.insert(init.track_id.clone(), key);
+          }
+        }
+        _ => {}
+      }
+    }
+    while let Some(message) = self.pc.poll_read() {
+      match message.message {
+        RTCMessage::DataChannelMessage(handle, message) => {
+          self.events.push_back(JsEvent::DataChannelMessage {
+            channel: handle as u32,
+            text: message.is_string,
+            data: Payload::new(message.data.to_vec()),
+          });
+        }
+        RTCMessage::RtpPacket(track_id, packet) => {
+          let Some(key) = self.key_for_track(&track_id) else {
+            continue;
+          };
+          if self.media.flowing.insert(key) {
+            self
+              .events
+              .push_back(JsEvent::TrackUnmute { transceiver: key });
+          }
+          self.media.saw_rtp(key, &packet.header);
+          self.count_received_frame(key, &packet);
+          let sink = self.sink_packet(key, &packet, now);
+          if let Some((width, height)) = sink.resize {
+            self.events.push_back(JsEvent::TrackResize {
+              transceiver: key,
+              width,
+              height,
+            });
+          }
+          if let Some(frame) = sink.frame {
+            self.events.push_back(JsEvent::MediaFrame {
+              transceiver: key,
+              key_frame: frame.key_frame,
+              mime_type: frame.mime_type,
+              rtp_timestamp: frame.rtp_timestamp,
+              width: frame.width_height.map(|(w, _)| w),
+              height: frame.width_height.map(|(_, h)| h),
+              data: Payload::new(frame.data),
+            });
+          }
+          if let Some(frame) = self.receive_for_transform(key, &packet) {
+            self.events.push_back(JsEvent::EncodedFrame {
+              transceiver: key,
+              data: Payload::new(frame.data),
+              key_frame: frame.key_frame,
+              width: frame.width_height.map(|(w, _)| w),
+              height: frame.width_height.map(|(_, h)| h),
+              info: frame.info,
+            });
+          }
+          if self.media.reading.contains(&key)
+            && let Ok(bytes) = packet.marshal()
+          {
+            self.events.push_back(JsEvent::Rtp {
+              transceiver: key,
+              data: Payload::new(bytes.to_vec()),
+            });
+          }
+        }
+        RTCMessage::RtcpPacket(track_id, packets) => {
+          if crate::media::wants_key_frame(&packets)
+            && let Some(key) = self.key_for_track(&track_id)
+          {
+            // A fake device's video starts over on its key frame.
+            if let Some(cursor) = self.media.fake.get_mut(&key) {
+              cursor.next = 0;
+            }
+            self
+              .events
+              .push_back(JsEvent::KeyFrameRequest { transceiver: key });
+          }
+        }
+        _ => {}
+      }
+    }
+    self.events.extend(closes);
+  }
+
+  /// Ends gathering once every server answered or gave up.
+  fn maybe_complete_gathering(&mut self) {
+    if self.gathering != GatherPhase::Running
+      || self.resolving > 0
+      || self.servers.iter().any(ServerClient::pending)
+    {
+      return;
+    }
+    self.gathering = GatherPhase::Complete;
+    // An empty candidate is the engine's end-of-candidates: it sets the
+    // gathering state to "complete" and emits the state change.
+    let _ = self.pc.add_local_candidate(RTCIceCandidateInit::default());
+  }
+
+  /// One driver pass: loop until the engine and the clients are idle.
+  fn pump(&mut self, guard: &dyn NetGuard) {
+    let now = Instant::now();
+    if self
+      .ice_up_at
+      .is_some_and(|t| now.duration_since(t) >= DTLS_TIMEOUT)
+    {
+      self.ice_up_at = None;
+      self.fail("DTLS did not connect after ICE did");
+    }
+    if let Some(since) = self.checking_since
+      && now.duration_since(since) >= CHECKING_STALL
+    {
+      self.checking_since = None;
+      if !self.failed && !self.remote_gathered {
+        self.events.push_back(JsEvent::IceConnectionState {
+          state: "disconnected".to_string(),
+        });
+        self.events.push_back(JsEvent::ConnectionState {
+          state: "disconnected".to_string(),
+        });
+      }
+    }
+    for _ in 0..MAX_PUMP_ROUNDS {
+      let a = self.flush_engine_writes(guard);
+      let b = self.service_servers(now);
+      self.maybe_complete_gathering();
+      self.fail_without_pairs();
+      // The transports' states before the events they come with (a channel's
+      // open after its SCTP transport is connected).
+      self.track_sctp_state();
+      self.track_dtls_state();
+      self.collect_events(now);
+      self.track_sent();
+      self.check_silence(now);
+      if !a && !b {
+        break;
+      }
+    }
+  }
+
+  fn next_deadline(&mut self) -> Option<Instant> {
+    let mut deadline = self.pc.poll_timeout();
+    for server in &mut self.servers {
+      if let Some(t) = server.client.poll_timeout() {
+        deadline = Some(deadline.map_or(t, |d| d.min(t)));
+      }
+    }
+    if let Some(up) = self.ice_up_at {
+      let t = up + DTLS_TIMEOUT;
+      deadline = Some(deadline.map_or(t, |d| d.min(t)));
+    }
+    if let Some(since) = self.checking_since {
+      let t = since + CHECKING_STALL;
+      deadline = Some(deadline.map_or(t, |d| d.min(t)));
+    }
+    if let Some(t) = self.sinks.silence_deadline() {
+      deadline = Some(deadline.map_or(t, |d| d.min(t)));
+    }
+    deadline
+  }
+
+  fn handle_timeout(&mut self, now: Instant) {
+    let _ = self.pc.handle_timeout(now);
+    for server in &mut self.servers {
+      let _ = server.client.handle_timeout(now);
+    }
+  }
+
+  fn handle_datagram(&mut self, dg: Datagram) {
+    if self.refused.contains(&dg.from) {
+      return;
+    }
+    let now = Instant::now();
+    match dg.via {
+      Via::Socket => {}
+      Via::Mdns => {
+        // Only what a responder sends from its mDNS port; the engine takes
+        // answers only from the mDNS socket (local port 5353).
+        if dg.from.port() == MDNS_PORT {
+          let _ = self.pc.handle_read(TaggedBytesMut {
+            now,
+            transport: TransportContext {
+              local_addr: dg.local,
+              peer_addr: dg.from,
+              ecn: None,
+              transport_protocol: TransportProtocol::UDP,
+            },
+            message: dg.data,
+          });
+        }
+        return;
+      }
+      Via::IceTcp(id) => {
+        if dg.closed.is_some() {
+          if self.tcp_links.get(&dg.from).is_some_and(|l| l.id == id) {
+            self.tcp_links.remove(&dg.from);
+          }
+          return;
+        }
+        if self.tcp_links.get(&dg.from).is_none_or(|l| l.id != id) {
+          return;
+        }
+        if is_stun(&dg.data) {
+          self.saw_stun(dg.from);
+        } else {
+          let from_selected = match self.selected {
+            Some((_, r)) => self.selected_tcp && r == dg.from,
+            None => self.ice_up && self.stun_peers.contains(&dg.from),
+          };
+          if !from_selected {
+            return;
+          }
+        }
+        let local = self.tcp_local(dg.local);
+        let _ = self.pc.handle_read(TaggedBytesMut {
+          now,
+          transport: TransportContext {
+            local_addr: local,
+            peer_addr: dg.from,
+            ecn: None,
+            transport_protocol: TransportProtocol::TCP,
+          },
+          message: dg.data,
+        });
+        return;
+      }
+    }
+    if let (Some(index), Some(reason)) = (dg.stream, dg.closed.as_ref()) {
+      if let Some(server) = self.servers.get_mut(index) {
+        let (url, base) = (server.url.clone(), server.base);
+        server.binding = None;
+        server.allocate = None;
+        server.relay = None;
+        self.report_error(
+          &url,
+          Some(base),
+          ERROR_CODE_UNREACHABLE,
+          format!("The TURN connection ended: {reason}"),
+        );
+      }
+      return;
+    }
+    if let Some(index) = dg.stream {
+      if let Some(server) = self.servers.get_mut(index) {
+        let protocol = server.protocol();
+        let _ = server.client.handle_read(TaggedBytesMut {
+          now,
+          transport: TransportContext {
+            local_addr: server.base,
+            peer_addr: dg.from,
+            ecn: None,
+            transport_protocol: protocol,
+          },
+          message: dg.data,
+        });
+      }
+      return;
+    }
+    // A reply from a STUN/TURN server on the UDP socket.
+    if let Some(server) = self.servers.iter_mut().find(|s| {
+      matches!(s.link, ServerLink::Udp)
+        && s.server == dg.from
+        && s.base.port() == dg.local.port()
+    }) {
+      let base = server.base;
+      let _ = server.client.handle_read(TaggedBytesMut {
+        now,
+        transport: TransportContext {
+          local_addr: base,
+          peer_addr: dg.from,
+          ecn: None,
+          transport_protocol: TransportProtocol::UDP,
+        },
+        message: dg.data,
+      });
+      return;
+    }
+    let Some(endpoint) = self
+      .endpoints
+      .iter()
+      .position(|e| e.bound.port() == dg.local.port())
+    else {
+      return;
+    };
+    let local = self.local_for(endpoint, dg.from);
+    if is_stun(&dg.data) {
+      self.saw_stun(dg.from);
+    } else if !self.is_from_selected_pair(local, dg.from, false) {
+      return;
+    }
+    let _ = self.pc.handle_read(TaggedBytesMut {
+      now,
+      transport: TransportContext {
+        local_addr: local,
+        peer_addr: dg.from,
+        ecn: dg.ecn,
+        transport_protocol: TransportProtocol::UDP,
+      },
+      message: dg.data,
+    });
+  }
+}
+
+impl Peer {
+  pub fn new(
+    options: PeerOptions,
+    guard: Rc<dyn NetGuard>,
+  ) -> Result<Rc<Self>, WebRtcError> {
+    let config = RTCConfigurationBuilder::new()
+      .with_certificates(options.certificates.clone())
+      .with_bundle_policy(options.bundle_policy)
+      .build();
+    let pacer_refusals = Arc::<crate::media::PacerRefusals>::default();
+    let (media_engine, registry) =
+      crate::media::media_stack_counting(pacer_refusals.clone())?;
+    // Messages up to 256 KiB, as browsers take (the engine's own default is
+    // RFC 8841's 64 KiB); the connection's maxMessageSize is the smaller of
+    // this and the peer's.
+    let net = options.network.as_ref().map(|n| &n.options);
+    // An ICE restart starts a new gathering phase (`regather`), so the
+    // previous generation's local candidates go with the old credentials.
+    let mut settings = SettingEngineBuilder::new()
+      .with_discard_local_candidates_during_ice_restart(true)
+      .with_sctp_max_message_size(SctpMaxMessageSize::Bounded(
+        net
+          .and_then(|n| n.max_message_size)
+          .unwrap_or(SctpMaxMessageSize::MAX_MESSAGE_SIZE),
+      ))
+      // ECN (L4S): the engine marks the RTP of a stream that negotiated
+      // `ack ccfb` ECT(1) and counts the codepoints datagrams arrive with,
+      // which the UDP sockets carry both ways where the platform lets them
+      // (`crate::ecn`). Over ICE-TCP and TURN relays nothing is marked on
+      // the wire, which the remote's feedback reports as bleached.
+      .with_ecn(crate::ecn::supported());
+    if let Some(net) = net {
+      settings = settings.with_lite(net.ice_lite);
+      if let Some((disconnected, failed, keep_alive)) = net.ice_timeouts {
+        settings = settings.with_ice_timeouts(disconnected, failed, keep_alive);
+      }
+    }
+    // mDNS: what the network asks for (resolving the peer's `.local`
+    // candidates by default, as browsers do), when it can be used here.
+    let mut mdns_note = None;
+    let mdns_mode = match net.map(|n| n.mdns).unwrap_or_default() {
+      MdnsMode::Off => MdnsMode::Off,
+      wanted => match mdns_permitted(&*guard) {
+        Ok(()) => wanted,
+        Err(why) => {
+          if wanted == MdnsMode::Gather {
+            mdns_note = Some(format!(
+              "Host candidates are not published under mDNS names: {why}"
+            ));
+          }
+          MdnsMode::Off
+        }
+      },
+    };
+    // Publishing names nobody could resolve would hide the host candidates
+    // for nothing: the socket is opened first, and a failure keeps them
+    // literal.
+    let mut mdns_socket = None;
+    let mdns_mode = if mdns_mode == MdnsMode::Gather {
+      match bind_mdns(&interface_addresses(
+        net.and_then(|n| n.interfaces.as_deref()),
+      )) {
+        Ok(socket) => {
+          mdns_socket = Some(Rc::new(EcnUdpSocket::plain(socket)));
+          MdnsMode::Gather
+        }
+        Err(e) => {
+          mdns_note = Some(format!(
+            "Host candidates are not published under mDNS names: {e}"
+          ));
+          MdnsMode::Resolve
+        }
+      }
+    } else {
+      mdns_mode
+    };
+    // 1:1 NAT in host mode: the engine announces a mapped host candidate on
+    // the public address and keeps its private socket as the base, which is
+    // what its remote-address policy pairs (a loopback remote only from a
+    // loopback base). It can't map an mDNS name.
+    let engine_nat = mdns_mode != MdnsMode::Gather
+      && net.is_some_and(|n| !n.public_srflx && !n.public_addresses.is_empty());
+    if engine_nat && let Some(net) = net {
+      settings = settings.with_nat_1to1_ips(
+        net
+          .public_addresses
+          .iter()
+          .map(|p| match p.private {
+            Some(private) => format!("{}/{private}", p.public),
+            None => p.public.to_string(),
+          })
+          .collect(),
+        RTCIceCandidateType::Host,
+      );
+    }
+    settings = settings
+      .with_multicast_dns_mode(match mdns_mode {
+        MdnsMode::Off => MulticastDnsMode::Disabled,
+        MdnsMode::Resolve => MulticastDnsMode::QueryOnly,
+        MdnsMode::Gather => MulticastDnsMode::QueryAndGather,
+      })
+      .with_multicast_dns_timeout(Some(MDNS_QUERY_TIMEOUT));
+    let settings = settings.build();
+    let pc = RTCPeerConnectionBuilder::new()
+      .with_configuration(config)
+      .with_setting_engine(settings)
+      .with_media_engine(media_engine)
+      .with_interceptor_registry(registry)
+      .build(Instant::now())
+      .map_err(rtc_err)?;
+    let (recv_tx, recv_rx) = mpsc::channel(RECV_QUEUE);
+    let mut events = VecDeque::new();
+    if let Some(note) = mdns_note {
+      events.push_back(JsEvent::IceCandidateError {
+        address: None,
+        port: None,
+        url: String::new(),
+        error_code: ERROR_CODE_UNREACHABLE,
+        error_text: note,
+      });
+    }
+    let peer = Rc::new_cyclic(|this| Self {
+      core: RefCell::new(Core {
+        pc,
+        options,
+        endpoints: Vec::new(),
+        servers: Vec::new(),
+        gathering: GatherPhase::NotStarted,
+        resolving: 0,
+        srflx_seen: HashSet::new(),
+        events,
+        allowed: HashSet::new(),
+        refused: HashSet::new(),
+        routes: HashMap::new(),
+        selected: None,
+        stun_peers: HashSet::new(),
+        ice_up: false,
+        ice_up_at: None,
+        dtls_connected: false,
+        failed: false,
+        recv_tx,
+        recv_rx: Some(recv_rx),
+        media: MediaState {
+          pacer_refusals,
+          ..Default::default()
+        },
+        transforms: Default::default(),
+        sinks: Default::default(),
+        remote_known: false,
+        sent: HashMap::new(),
+        sctp_state: "",
+        dtls_state: String::new(),
+        local_gathered: 0,
+        remote_gathered: false,
+        checking_held: false,
+        restart_masked: false,
+        checking_since: None,
+        this: this.clone(),
+        tcp_links: HashMap::new(),
+        tcp_dialing: HashMap::new(),
+        next_tcp_link: 0,
+        selected_tcp: false,
+        mdns_mode,
+        mdns_socket: mdns_socket.clone(),
+        mdns_failed: false,
+        engine_nat,
+      }),
+      guard,
+      wake: Notify::new(),
+      events_ready: Notify::new(),
+      cancel: CancelHandle::new_rc(),
+      closed: Cell::new(false),
+      driver_started: Cell::new(false),
+    });
+    if let Some(socket) = mdns_socket {
+      spawn_udp_reader_via(
+        socket,
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), MDNS_PORT),
+        peer.core.borrow().recv_tx.clone(),
+        peer.cancel.clone(),
+        Via::Mdns,
+      );
+    }
+    Ok(peer)
+  }
+
+  pub fn is_closed(&self) -> bool {
+    self.closed.get()
+  }
+
+  /// The panic boundary: runs `f` on the engine; a panic poisons the
+  /// connection (`failed`, then closed) and becomes an `OperationError`.
+  fn guarded<T>(
+    &self,
+    f: impl FnOnce(&mut Core) -> Result<T, WebRtcError>,
+  ) -> Result<T, WebRtcError> {
+    if self.closed.get() {
+      return Err(WebRtcError::InvalidState(
+        "RTCPeerConnection is closed".to_string(),
+      ));
+    }
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      f(&mut self.core.borrow_mut())
+    }));
+    match result {
+      Ok(r) => r,
+      Err(_) => {
+        self.poison();
+        Err(WebRtcError::Operation(
+          "the WebRTC engine failed; the connection is closed".to_string(),
+        ))
+      }
+    }
+  }
+
+  fn poison(&self) {
+    if let Ok(mut core) = self.core.try_borrow_mut() {
+      core.fail("engine panic");
+    }
+    self.shutdown(false);
+  }
+
+  /// Ops call this after changing the engine: the driver flushes what the
+  /// change produced and JavaScript gets the resulting events.
+  pub fn poke(&self) {
+    self.wake.notify_one();
+  }
+
+  /// The next batch of events, or `None` once the connection is closed and
+  /// the queue is drained.
+  pub async fn next_events(&self) -> Option<Vec<JsEvent>> {
+    loop {
+      {
+        let mut core = self.core.borrow_mut();
+        if !core.events.is_empty() {
+          return Some(core.events.drain(..).collect());
+        }
+        if self.closed.get() {
+          return None;
+        }
+      }
+      self.events_ready.notified().await;
+    }
+  }
+
+  pub fn create_offer(
+    self: &Rc<Self>,
+    ice_restart: bool,
+  ) -> Result<String, WebRtcError> {
+    let sdp = self.guarded(|core| {
+      if ice_restart {
+        core.pc.restart_ice();
+      }
+      Ok(core.pc.create_offer(None).map_err(rtc_err)?.sdp)
+    })?;
+    Ok(sdp)
+  }
+
+  /// `setConfiguration`: the ICE servers and policy the next gathering
+  /// (an ICE restart) uses.
+  pub fn set_ice_servers(
+    &self,
+    specs: Vec<IceServerSpec>,
+    relay_only: bool,
+    tls: Option<Arc<rustls::ClientConfig>>,
+  ) {
+    let mut core = self.core.borrow_mut();
+    core.options.ice_servers = specs;
+    core.options.relay_only = relay_only;
+    if tls.is_some() {
+      core.options.tls = tls;
+    }
+  }
+
+  pub fn selected_pair(&self) -> Option<(SocketAddr, SocketAddr)> {
+    self.core.borrow().selected
+  }
+
+  /// The ICE agent's selected candidate pair (W3C webrtc-pc 5.6
+  /// `getSelectedCandidatePair()`): the nominated pair as soon as ICE has
+  /// one, on the controlled side too, before either side sent anything on it.
+  /// `None` before that, or when the connection is closed.
+  pub fn ice_selected_pair(&self) -> Option<SelectedPair> {
+    if self.closed.get() {
+      return None;
+    }
+    self
+      .guarded(|core| Ok(core.ice_selected_pair()))
+      .ok()
+      .flatten()
+  }
+
+  /// Whether the selected pair is an ICE-TCP one.
+  pub fn selected_is_tcp(&self) -> bool {
+    self.core.borrow().selected_tcp
+  }
+
+  pub fn create_answer(&self) -> Result<String, WebRtcError> {
+    self.guarded(|core| Ok(core.pc.create_answer(None).map_err(rtc_err)?.sdp))
+  }
+
+  fn description(
+    kind: &str,
+    sdp: String,
+  ) -> Result<RTCSessionDescription, WebRtcError> {
+    match kind {
+      "offer" => RTCSessionDescription::offer(sdp),
+      "answer" => RTCSessionDescription::answer(sdp),
+      "pranswer" => RTCSessionDescription::pranswer(sdp),
+      "rollback" => RTCSessionDescription::rollback(None),
+      other => {
+        return Err(WebRtcError::Type(format!(
+          "'{other}' is not a valid RTCSdpType"
+        )));
+      }
+    }
+    .map_err(rtc_err)
+  }
+
+  pub fn set_local_description(
+    self: &Rc<Self>,
+    kind: &str,
+    sdp: String,
+  ) -> Result<(), WebRtcError> {
+    check_sdp_size(kind, &sdp)?;
+    // Gathering starts with the first description that has a transport to
+    // gather for (W3C: an m-section that isn't rejected).
+    let has_transport = has_live_media_section(&sdp);
+    let desc = Self::description(kind, sdp)?;
+    let restarted = self.guarded(|core| {
+      let ufrag_before = core.local_ufrag();
+      let applied = core.pc.set_local_description(Instant::now(), desc);
+      // The engine may have removed transceivers (a rollback, an answer
+      // rejecting a stopped one's section), even on the way to an error.
+      core.sync_removed_transceivers();
+      applied.map_err(|e| match e {
+        // JSEP: an offer or answer other than the last one created.
+        RtcError::ErrSDPDoesNotMatchOffer
+        | RtcError::ErrSDPDoesNotMatchAnswer => {
+          WebRtcError::InvalidModification(e.to_string())
+        }
+        e => description_err(e),
+      })?;
+      Ok(
+        kind != "rollback"
+          && ufrag_before.is_some()
+          && core.local_ufrag() != ufrag_before,
+      )
+    })?;
+    if kind != "rollback" && has_transport {
+      if restarted {
+        self.regather();
+      } else {
+        self.start_gathering();
+      }
+      self.register_on_shared_port();
+    }
+    self.ensure_driver();
+    self.poke();
+    Ok(())
+  }
+
+  /// On a shared-port network, the local ufrag routes the remote peer's
+  /// checks to this connection (registered again after an ICE restart).
+  fn register_on_shared_port(&self) {
+    let core = self.core.borrow();
+    if let Some(net) = core
+      .options
+      .network
+      .as_ref()
+      .filter(|n| n.routes_by_ufrag())
+      && let Some(ufrag) = core.local_ufrag()
+    {
+      net.register_ufrag(ufrag, &core.this);
+    }
+  }
+
+  /// A datagram a shared-port network routed to this connection.
+  pub(crate) fn deliver(&self, dg: Datagram) {
+    if self.closed.get() {
+      return;
+    }
+    if let Ok(core) = self.core.try_borrow() {
+      let _ = core.recv_tx.try_send(dg);
+    }
+  }
+
+  /// Checks every candidate the remote description carries and hands the
+  /// engine a copy without the ones it can't use (see
+  /// [`RemoteCandidate::Ignore`]). A refused address fails the whole call.
+  pub fn set_remote_description(
+    self: &Rc<Self>,
+    kind: &str,
+    sdp: String,
+  ) -> Result<(), WebRtcError> {
+    check_sdp_size(kind, &sdp)?;
+    let mut kept = String::with_capacity(sdp.len());
+    let mut checked = Vec::new();
+    let mut named = false;
+    let (tcp, mut mdns) = {
+      let core = self.core.borrow();
+      (core.ice_tcp(), core.mdns_mode != MdnsMode::Off)
+    };
+    for line in sdp.split_inclusive('\n') {
+      if let Some(value) = line.trim_end().strip_prefix("a=candidate:") {
+        match classify_remote_candidate(value, tcp, mdns)? {
+          RemoteCandidate::Ignore => continue,
+          RemoteCandidate::Udp(addr) | RemoteCandidate::Tcp(addr) => {
+            self.guard.connect(addr).map_err(WebRtcError::Permission)?;
+            checked.push(addr);
+          }
+          RemoteCandidate::Mdns => {
+            if !self.core.borrow_mut().resolves_mdns() {
+              mdns = false;
+              continue;
+            }
+            named = true;
+          }
+        }
+      }
+      kept.push_str(line);
+    }
+    let end_of_candidates =
+      kept.lines().any(|l| l.trim_end() == "a=end-of-candidates");
+    let desc = Self::description(kind, kept)?;
+    self.guarded(|core| {
+      let ufrag_before = core.remote_ufrag();
+      let applied = core.pc.set_remote_description(Instant::now(), desc);
+      core.sync_removed_transceivers();
+      applied.map_err(description_err)?;
+      // An ICE restart by the remote side: its candidates, and its
+      // end-of-candidates, start over.
+      if ufrag_before.is_some() && core.remote_ufrag() != ufrag_before {
+        core.remote_known = false;
+        core.remote_gathered = false;
+      }
+      if end_of_candidates {
+        core.remote_gathered = true;
+      }
+      for addr in checked {
+        core.mark_allowed(addr);
+      }
+      if named {
+        core.remote_known = true;
+      }
+      Ok(())
+    })?;
+    self.ensure_driver();
+    self.poke();
+    Ok(())
+  }
+
+  pub fn add_ice_candidate(
+    &self,
+    candidate: String,
+    sdp_mid: Option<String>,
+    sdp_m_line_index: Option<u16>,
+    username_fragment: Option<String>,
+  ) -> Result<(), WebRtcError> {
+    if candidate.trim().is_empty() {
+      // End-of-candidates: the engine checks the media section and the
+      // usernameFragment and marks the remote description; then the
+      // remote's current generation is complete.
+      self.guarded(|core| {
+        core
+          .pc
+          .add_remote_candidate(RTCIceCandidateInit {
+            candidate: String::new(),
+            sdp_mid,
+            sdp_mline_index: sdp_m_line_index,
+            username_fragment,
+            url: None,
+          })
+          .map_err(rtc_err)
+      })?;
+      self.core.borrow_mut().remote_gathered = true;
+      self.poke();
+      return Ok(());
+    }
+    let (tcp, mdns) = {
+      let core = self.core.borrow();
+      (core.ice_tcp(), core.mdns_mode != MdnsMode::Off)
+    };
+    let addr = match classify_remote_candidate(&candidate, tcp, mdns)? {
+      RemoteCandidate::Ignore => return Ok(()),
+      RemoteCandidate::Mdns => {
+        if !self.core.borrow_mut().resolves_mdns() {
+          return Ok(());
+        }
+        None
+      }
+      RemoteCandidate::Udp(addr) | RemoteCandidate::Tcp(addr) => Some(addr),
+    };
+    if let Some(addr) = addr {
+      self.guard.connect(addr).map_err(WebRtcError::Permission)?;
+    }
+    self.guarded(|core| {
+      core
+        .pc
+        .add_remote_candidate(RTCIceCandidateInit {
+          candidate,
+          sdp_mid,
+          sdp_mline_index: sdp_m_line_index,
+          username_fragment,
+          url: None,
+        })
+        .map_err(rtc_err)?;
+      match addr {
+        Some(addr) => core.mark_allowed(addr),
+        None => core.remote_known = true,
+      }
+      Ok(())
+    })?;
+    self.poke();
+    Ok(())
+  }
+
+  /// Returns the channel's engine handle and its SCTP stream id when it
+  /// already has one (a negotiated channel).
+  pub fn create_data_channel(
+    self: &Rc<Self>,
+    label: &str,
+    init: RTCDataChannelInit,
+  ) -> Result<(u32, Option<u16>), WebRtcError> {
+    let created = self.guarded(|core| {
+      let channel = core
+        .pc
+        .create_data_channel(label, Some(init))
+        .map_err(rtc_err)?;
+      let handle = channel.id() as u32;
+      let id = channel.stream_id();
+      core.sent.insert(handle, 0);
+      // A negotiated channel created on a live association is open at once
+      // and the engine reports no open for it; JavaScript still gets its
+      // `open` event (asynchronously, as the spec has it).
+      if channel.ready_state() == RTCDataChannelState::Open {
+        let open = JsEvent::DataChannelOpen {
+          channel: handle,
+          id,
+          label: channel.label().to_string(),
+          protocol: channel.protocol().to_string(),
+          ordered: channel.ordered(),
+          max_packet_life_time: channel.max_packet_life_time(),
+          max_retransmits: channel.max_retransmits(),
+          negotiated: channel.negotiated(),
+          priority: channel.priority(),
+        };
+        core.events.push_back(open);
+      }
+      Ok((handle, id))
+    })?;
+    self.events_ready.notify_one();
+    self.poke();
+    Ok(created)
+  }
+
+  /// Sends one message and returns the channel's buffered amount after it.
+  pub fn send(
+    &self,
+    handle: u32,
+    text: bool,
+    data: &[u8],
+  ) -> Result<u32, WebRtcError> {
+    let buffered = self.guarded(|core| {
+      let Some(mut channel) = core.pc.data_channel(handle as RTCDataChannelId)
+      else {
+        return Err(WebRtcError::InvalidState(
+          "RTCDataChannel is closed".to_string(),
+        ));
+      };
+      let now = Instant::now();
+      let sent = if text {
+        let s = std::str::from_utf8(data)
+          .map_err(|e| WebRtcError::Type(e.to_string()))?;
+        channel.send_text(now, s)
+      } else {
+        channel.send(now, BytesMut::from(data))
+      };
+      match sent {
+        Ok(()) => {}
+        // W3C: a message over the SCTP transport's maxMessageSize is a
+        // TypeError; a channel that isn't open an InvalidStateError.
+        Err(RtcError::ErrOutboundPacketTooLarge) => {
+          return Err(WebRtcError::Type(format!(
+            "The message ({} bytes) is larger than the connection's maxMessageSize",
+            data.len()
+          )));
+        }
+        Err(
+          e @ (RtcError::ErrDataChannelNotOpen | RtcError::ErrDataChannelClosed),
+        ) => {
+          return Err(WebRtcError::InvalidState(e.to_string()));
+        }
+        Err(e) => return Err(rtc_err(e)),
+      }
+      Ok(u32::try_from(channel.outstanding_bytes()).unwrap_or(u32::MAX))
+    })?;
+    self.poke();
+    Ok(buffered)
+  }
+
+  /// Bytes sent that SCTP hasn't released (acknowledged or abandoned): the
+  /// engine's send back-pressure, which the tests watch drain.
+  #[cfg(test)]
+  pub fn buffered_amount(&self, handle: u32) -> u32 {
+    let mut core = self.core.borrow_mut();
+    core
+      .pc
+      .data_channel(handle as RTCDataChannelId)
+      .map(|c| u32::try_from(c.outstanding_bytes()).unwrap_or(u32::MAX))
+      .unwrap_or(0)
+  }
+
+  /// `RTCDataChannel.id`: the SCTP stream id, once the engine has assigned
+  /// one (when the DTLS role is negotiated, RFC 8832 section 6).
+  pub fn data_channel_id(&self, handle: u32) -> Option<u16> {
+    let mut core = self.core.borrow_mut();
+    core
+      .pc
+      .data_channel(handle as RTCDataChannelId)
+      .and_then(|c| c.stream_id())
+  }
+
+  pub fn set_buffered_amount_low_threshold(&self, handle: u32, threshold: u32) {
+    let _ = self.guarded(|core| {
+      if let Some(mut channel) =
+        core.pc.data_channel(handle as RTCDataChannelId)
+      {
+        channel.set_buffered_amount_low_threshold(threshold);
+      }
+      Ok(())
+    });
+  }
+
+  pub fn close_data_channel(&self, handle: u32) {
+    let _ = self.guarded(|core| {
+      if let Some(mut channel) =
+        core.pc.data_channel(handle as RTCDataChannelId)
+      {
+        let _ = channel.close();
+      }
+      Ok(())
+    });
+    self.poke();
+  }
+
+  /// `RTCSctpTransport.maxMessageSize`, once SCTP is up.
+  pub fn max_message_size(&self) -> Option<u32> {
+    self
+      .core
+      .borrow()
+      .pc
+      .sctp()
+      .and_then(|s| s.max_message_size())
+  }
+
+  /// `localDescription`: the pending local description, else the current
+  /// one.
+  pub fn local_description(&self) -> Option<(String, String)> {
+    let d = self.descriptions();
+    d.pending_local.or(d.current_local)
+  }
+
+  /// `remoteDescription`: the pending remote description, else the current
+  /// one.
+  pub fn remote_description(&self) -> Option<(String, String)> {
+    let d = self.descriptions();
+    d.pending_remote.or(d.current_remote)
+  }
+
+  /// The four description slots of the W3C API, each as `(type, sdp)`: a
+  /// current description stays in place while a new offer is pending, as
+  /// `currentLocalDescription` / `pendingLocalDescription` (and the remote
+  /// pair) have it.
+  pub fn descriptions(&self) -> PeerDescriptions {
+    let core = self.core.borrow();
+    let redact = core.mdns_mode == MdnsMode::Gather;
+    let local = |d: RTCSessionDescription| {
+      let sdp = if redact {
+        d.sdp
+          .split_inclusive('\n')
+          .map(|line| match line.strip_prefix("a=candidate:") {
+            Some(_) if line.contains(" raddr ") => {
+              let end = line.len() - line.trim_end().len();
+              let (body, tail) = line.split_at(line.len() - end);
+              redact_related_address(body) + tail
+            }
+            _ => line.to_string(),
+          })
+          .collect()
+      } else {
+        d.sdp
+      };
+      (d.sdp_type.to_string(), sdp)
+    };
+    let remote =
+      |d: &RTCSessionDescription| (d.sdp_type.to_string(), d.sdp.clone());
+    PeerDescriptions {
+      current_local: core.pc.current_local_description().map(local),
+      pending_local: core.pc.pending_local_description().map(local),
+      current_remote: core.pc.current_remote_description().map(remote),
+      pending_remote: core.pc.pending_remote_description().map(remote),
+    }
+  }
+
+  /// `getStats()`; `selector` is a transceiver key and whether its sender
+  /// (else its receiver) is the selector.
+  pub fn stats(
+    &self,
+    selector: Option<(u32, bool)>,
+  ) -> Result<Vec<serde_json::Value>, WebRtcError> {
+    self.guarded(|core| {
+      let selector = match selector {
+        None => StatsSelector::None,
+        Some((key, sender)) => {
+          let Some(index) = core.media.keys.iter().position(|k| *k == key)
+          else {
+            return Ok(Vec::new());
+          };
+          if sender {
+            StatsSelector::Sender(index.into())
+          } else {
+            StatsSelector::Receiver(index.into())
+          }
+        }
+      };
+      let wall_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+        * 1000.0;
+      let now = Instant::now();
+      core.refresh_media_stats(now);
+      let report = core.pc.get_stats(now, selector);
+      use RTCStatsReportEntry as E;
+      let mut stats: Vec<serde_json::Value> = report
+        .iter()
+        .filter_map(|entry| {
+          match entry {
+            E::PeerConnection(s) => serde_json::to_value(s),
+            E::Transport(s) => serde_json::to_value(s),
+            E::IceCandidatePair(s) => serde_json::to_value(s),
+            E::LocalCandidate(s) => serde_json::to_value(s),
+            E::RemoteCandidate(s) => serde_json::to_value(s),
+            E::Certificate(s) => serde_json::to_value(s),
+            E::Codec(s) => serde_json::to_value(s),
+            E::DataChannel(s) => serde_json::to_value(s),
+            E::InboundRtp(s) => serde_json::to_value(s),
+            E::OutboundRtp(s) => serde_json::to_value(s),
+            E::RemoteInboundRtp(s) => serde_json::to_value(s),
+            E::RemoteOutboundRtp(s) => serde_json::to_value(s),
+            E::AudioSource(s) => serde_json::to_value(s),
+            E::VideoSource(s) => serde_json::to_value(s),
+            E::AudioPlayout(s) => serde_json::to_value(s),
+            _ => return None,
+          }
+          .ok()
+          .map(|stats| epoch_fields_relative(stats, wall_ms))
+        })
+        .collect();
+      add_pacer_refusals(&mut stats, core.media.pacer_refusals.get());
+      Ok(stats)
+    })
+  }
+
+  /// Runs a media operation on the engine (media.rs), then lets the driver
+  /// flush what it produced.
+  pub fn media<T>(
+    &self,
+    f: impl FnOnce(&mut Core) -> Result<T, WebRtcError>,
+  ) -> Result<T, WebRtcError> {
+    let out = self.guarded(f)?;
+    self.events_ready.notify_one();
+    self.poke();
+    Ok(out)
+  }
+
+  /// `close()`: stops the engine, the sockets and the driver. Idempotent.
+  pub fn close(&self) {
+    self.shutdown(true);
+  }
+
+  fn shutdown(&self, graceful: bool) {
+    if self.closed.replace(true) {
+      return;
+    }
+    if graceful && let Ok(mut core) = self.core.try_borrow_mut() {
+      let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let now = Instant::now();
+        let _ = core.pc.close();
+        core.collect_events(now);
+        for server in &mut core.servers {
+          if let Some(relay) = server.relay
+            && let Ok(mut relay) = server.client.relay(relay)
+          {
+            let _ = relay.close(now);
+          }
+        }
+        // A last flush so the peer hears the SCTP abort / DTLS close and a
+        // TURN allocation is released, then the sockets go.
+        let writes: Vec<_> =
+          std::iter::from_fn(|| core.pc.poll_write()).collect();
+        for msg in writes {
+          if core.allowed.contains(&msg.transport.peer_addr)
+            && core
+              .servers
+              .iter()
+              .all(|s| s.relay != Some(msg.transport.local_addr))
+            && let Some(socket) = core.endpoint_for(msg.transport.local_addr)
+          {
+            let _ = socket.try_send_to_ecn(
+              &msg.message,
+              msg.transport.peer_addr,
+              msg.transport.ecn,
+            );
+          }
+        }
+        let mut udp_writes = Vec::new();
+        for server in &mut core.servers {
+          while let Some(tx) = server.client.poll_write() {
+            match &server.link {
+              ServerLink::Stream(writer) => {
+                let _ = writer.send(tx.message.to_vec());
+              }
+              ServerLink::Udp => udp_writes.push(tx),
+            }
+          }
+        }
+        for tx in udp_writes {
+          if let Some(socket) = core.endpoint_for(tx.transport.local_addr) {
+            let _ = socket.try_send_to(&tx.message, tx.transport.peer_addr);
+          }
+        }
+      }));
+    }
+    if let Ok(mut core) = self.core.try_borrow_mut() {
+      core.servers.clear();
+      core.endpoints.clear();
+      core.tcp_links.clear();
+      core.tcp_dialing.clear();
+      core.mdns_socket = None;
+      if let Some(net) = core.options.network.take() {
+        net.forget(self);
+      }
+    }
+    self.cancel.cancel();
+    self.wake.notify_one();
+    self.events_ready.notify_one();
+  }
+
+  /// An ICE-TCP stream the network accepted for this connection (its first
+  /// frame, a binding request, named our ufrag).
+  pub(crate) fn adopt_tcp(
+    self: &Rc<Self>,
+    stream: tokio::net::TcpStream,
+    remote: SocketAddr,
+    decoder: TcpFrameDecoder,
+    first: Vec<u8>,
+  ) {
+    self.attach_tcp(stream, remote, decoder, Some(first));
+  }
+
+  /// Starts an ICE-TCP connection's reader and writer and makes it the one
+  /// frames to `remote` go out on (with what waited while it was dialled).
+  fn attach_tcp(
+    self: &Rc<Self>,
+    stream: tokio::net::TcpStream,
+    remote: SocketAddr,
+    decoder: TcpFrameDecoder,
+    first: Option<Vec<u8>>,
+  ) {
+    if self.closed.get() {
+      return;
+    }
+    let Ok(local) = stream.local_addr() else {
+      return;
+    };
+    let mut core = self.core.borrow_mut();
+    let queued = core.tcp_dialing.remove(&remote).unwrap_or_default();
+    if core.tcp_links.len() >= MAX_TCP_LINKS
+      && !core.tcp_links.contains_key(&remote)
+    {
+      return;
+    }
+    core.next_tcp_link += 1;
+    let id = core.next_tcp_link;
+    let (writer, rx) = mpsc::channel(TCP_WRITE_QUEUE);
+    for frame in queued {
+      let _ = writer.try_send(frame);
+    }
+    core.tcp_links.insert(remote, TcpLink { id, writer });
+    let recv_tx = core.recv_tx.clone();
+    drop(core);
+    let (r, w) = stream.into_split();
+    deno_core::unsync::spawn(
+      read_ice_tcp(r, local, remote, id, decoder, first, recv_tx)
+        .or_cancel(self.cancel.clone()),
+    );
+    deno_core::unsync::spawn(
+      write_ice_tcp(w, rx).or_cancel(self.cancel.clone()),
+    );
+    self.ensure_driver();
+    self.poke();
+  }
+
+  fn ensure_driver(self: &Rc<Self>) {
+    if self.driver_started.replace(true) || self.closed.get() {
+      return;
+    }
+    let Some(rx) = self.core.borrow_mut().recv_rx.take() else {
+      return;
+    };
+    let peer = self.clone();
+    let cancel = self.cancel.clone();
+    deno_core::unsync::spawn(async move {
+      let _ = run_driver(peer, rx).or_cancel(cancel).await;
+    });
+  }
+
+  /// Binds one UDP socket per family and adds the host candidates, then
+  /// starts one client per ICE server, once (the first
+  /// `setLocalDescription`).
+  /// An ICE restart applied by setLocalDescription: a new gathering phase
+  /// (RFC 8445 section 9, JSEP section 3.5.1) on the sockets already bound,
+  /// under the current ICE candidate policy and servers. The engine dropped
+  /// the previous generation's local candidates when it applied the restart.
+  fn regather(self: &Rc<Self>) {
+    let specs = {
+      let mut core = self.core.borrow_mut();
+      if core.gathering == GatherPhase::NotStarted {
+        drop(core);
+        self.start_gathering();
+        return;
+      }
+      core.gathering = GatherPhase::Running;
+      core.failed = false;
+      core.local_gathered = 0;
+      core.events.push_back(JsEvent::IceGatheringState {
+        state: "gathering".to_string(),
+      });
+      let opts = core.gather_options();
+      let gather_names = core.mdns_mode == MdnsMode::Gather;
+      let endpoints: Vec<(SocketAddr, Vec<IpAddr>)> = core
+        .endpoints
+        .iter()
+        .map(|e| (e.bound, e.hosts.clone()))
+        .collect();
+      let mut advertised: HashSet<SocketAddr> = HashSet::new();
+      for (bound, hosts) in endpoints {
+        core.announce_udp_hosts(
+          &opts,
+          bound,
+          &hosts,
+          gather_names,
+          &mut advertised,
+        );
+      }
+      if !core.options.relay_only {
+        core.gather_tcp(&opts, gather_names);
+      }
+      core.servers.clear();
+      core.resolving = core.options.ice_servers.len();
+      core.options.ice_servers.clone()
+    };
+    for spec in specs {
+      let peer = self.clone();
+      let cancel = self.cancel.clone();
+      deno_core::unsync::spawn(async move {
+        let _ = add_server(peer, spec).or_cancel(cancel).await;
+      });
+    }
+    self.poke();
+  }
+
+  fn start_gathering(self: &Rc<Self>) {
+    let specs = {
+      let mut core = self.core.borrow_mut();
+      if core.gathering != GatherPhase::NotStarted {
+        return;
+      }
+      core.gathering = GatherPhase::Running;
+      core.events.push_back(JsEvent::IceGatheringState {
+        state: "gathering".to_string(),
+      });
+
+      // (socket, bound address, host candidate addresses, own reader)
+      let mut planned: Vec<(Rc<EcnUdpSocket>, SocketAddr, Vec<IpAddr>, bool)> =
+        Vec::new();
+      let net = core.options.network.clone();
+      let opts = core.gather_options();
+      match net.as_ref().filter(|n| n.is_shared()) {
+        Some(net) => {
+          for e in &net.shared {
+            planned.push((e.socket.clone(), e.bound, e.hosts.clone(), false));
+          }
+        }
+        None => match crate::net::bind_plan(&opts, &*self.guard) {
+          Ok((plan, notes)) => {
+            for note in notes {
+              core.report_error("", None, ERROR_CODE_UNREACHABLE, note);
+            }
+            for (bind, hosts) in plan {
+              let socket = match opts.port_range {
+                Some(range) => crate::net::bind_in_range(bind, range),
+                None => bind_udp(SocketAddr::new(bind, 0)),
+              };
+              let socket = match socket {
+                Ok(s) => Rc::new(EcnUdpSocket::new(s)),
+                Err(e) => {
+                  core.report_error(
+                    "",
+                    Some(SocketAddr::new(bind, 0)),
+                    ERROR_CODE_UNREACHABLE,
+                    e.to_string(),
+                  );
+                  continue;
+                }
+              };
+              let Ok(bound) = socket.local_addr() else {
+                continue;
+              };
+              planned.push((socket, bound, hosts, true));
+            }
+          }
+          Err(e) => {
+            core.report_error("", None, ERROR_CODE_UNREACHABLE, e.to_string())
+          }
+        },
+      }
+
+      let mut advertised: HashSet<SocketAddr> = HashSet::new();
+      let gather_names = core.mdns_mode == MdnsMode::Gather;
+      for (socket, bound, hosts, own_reader) in planned {
+        if own_reader {
+          spawn_udp_reader(
+            socket.clone(),
+            bound,
+            core.recv_tx.clone(),
+            self.cancel.clone(),
+          );
+        }
+        core.announce_udp_hosts(
+          &opts,
+          bound,
+          &hosts,
+          gather_names,
+          &mut advertised,
+        );
+        core.endpoints.push(UdpEndpoint {
+          socket,
+          bound,
+          hosts,
+        });
+      }
+      if !core.options.relay_only {
+        core.gather_tcp(&opts, gather_names);
+      }
+      core.resolving = core.options.ice_servers.len();
+      core.options.ice_servers.clone()
+    };
+    for spec in specs {
+      let peer = self.clone();
+      let cancel = self.cancel.clone();
+      deno_core::unsync::spawn(async move {
+        let _ = add_server(peer, spec).or_cancel(cancel).await;
+      });
+    }
+    self.poke();
+  }
+}
+
+/// The host addresses candidates are gathered on: all of them, except that a
+/// connection publishing mDNS names leaves out loopback when it has another
+/// address (a name for 127.0.0.1 would send a LAN peer to itself).
+fn published_hosts(hosts: &[IpAddr], gather_names: bool) -> Vec<IpAddr> {
+  if gather_names && hosts.iter().any(|ip| !ip.is_loopback()) {
+    hosts
+      .iter()
+      .copied()
+      .filter(|ip| !ip.is_loopback())
+      .collect()
+  } else {
+    hosts.to_vec()
+  }
+}
+
+/// Dials a remote passive ICE-TCP candidate, from `bind` when given.
+async fn connect_tcp(
+  bind: Option<IpAddr>,
+  to: SocketAddr,
+) -> std::io::Result<tokio::net::TcpStream> {
+  let socket = if to.is_ipv4() {
+    tokio::net::TcpSocket::new_v4()?
+  } else {
+    tokio::net::TcpSocket::new_v6()?
+  };
+  if let Some(ip) = bind.filter(|ip| ip.is_ipv4() == to.is_ipv4()) {
+    socket.bind(SocketAddr::new(ip, 0))?;
+  }
+  let stream = socket.connect(to).await?;
+  let _ = stream.set_nodelay(true);
+  Ok(stream)
+}
+
+/// Reads RFC 4571 frames off an ICE-TCP connection into the driver's queue
+/// (waiting when it is full: a stream pushes back instead of dropping), then
+/// tells the driver the connection ended.
+async fn read_ice_tcp<R: tokio::io::AsyncRead + Unpin>(
+  mut reader: R,
+  local: SocketAddr,
+  remote: SocketAddr,
+  id: u64,
+  mut decoder: TcpFrameDecoder,
+  first: Option<Vec<u8>>,
+  tx: mpsc::Sender<Datagram>,
+) {
+  let datagram = |data: BytesMut, closed: Option<String>| Datagram {
+    local,
+    from: remote,
+    stream: None,
+    via: Via::IceTcp(id),
+    data,
+    closed,
+    ecn: None,
+  };
+  if let Some(frame) = first
+    && tx
+      .send(datagram(BytesMut::from(&frame[..]), None))
+      .await
+      .is_err()
+  {
+    return;
+  }
+  let mut chunk = vec![0u8; RECV_BUFFER_SIZE];
+  let reason = 'read: loop {
+    while let Some(frame) = decoder.next_packet() {
+      if tx
+        .send(datagram(BytesMut::from(&frame[..]), None))
+        .await
+        .is_err()
+      {
+        return;
+      }
+    }
+    let n = match reader.read(&mut chunk).await {
+      Ok(0) => break 'read "the peer closed the connection".to_string(),
+      Err(e) => break 'read e.to_string(),
+      Ok(n) => n,
+    };
+    if decoder.push(&chunk[..n]).is_err() {
+      break 'read "the peer sent more than it framed".to_string();
+    }
+  };
+  let _ = tx.send(datagram(BytesMut::new(), Some(reason))).await;
+}
+
+/// Writes queued RFC 4571 frames to an ICE-TCP connection.
+async fn write_ice_tcp<W: tokio::io::AsyncWrite + Unpin>(
+  mut writer: W,
+  mut rx: mpsc::Receiver<Vec<u8>>,
+) {
+  while let Some(frame) = rx.recv().await {
+    if writer.write_all(&frame).await.is_err() {
+      let _ = writer.shutdown().await;
+      return;
+    }
+  }
+}
+
+fn spawn_udp_reader(
+  socket: Rc<EcnUdpSocket>,
+  local: SocketAddr,
+  tx: mpsc::Sender<Datagram>,
+  cancel: Rc<CancelHandle>,
+) {
+  spawn_udp_reader_via(socket, local, tx, cancel, Via::Socket);
+}
+
+fn spawn_udp_reader_via(
+  socket: Rc<EcnUdpSocket>,
+  local: SocketAddr,
+  tx: mpsc::Sender<Datagram>,
+  cancel: Rc<CancelHandle>,
+  via: Via,
+) {
+  deno_core::unsync::spawn(
+    async move {
+      let mut buf = vec![0u8; RECV_BUFFER_SIZE];
+      loop {
+        match socket.recv_from(&mut buf).await {
+          Ok((n, from, ecn)) => {
+            let dg = Datagram {
+              local,
+              from,
+              stream: None,
+              via,
+              data: BytesMut::from(&buf[..n]),
+              closed: None,
+              ecn,
+            };
+            if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(dg) {
+              break;
+            }
+          }
+          Err(e) => {
+            // ICMP port unreachable surfaces as a read error on some
+            // platforms (Windows' WSAECONNRESET); keep reading.
+            log::debug!("webrtc: recv on {local}: {e}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+          }
+        }
+      }
+    }
+    .or_cancel(cancel),
+  );
+}
+
+/// Reads RFC 6544 frames off a TURN server stream into the driver's queue;
+/// when the stream ends, tells the driver why.
+async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
+  mut reader: R,
+  local: SocketAddr,
+  server: SocketAddr,
+  index: usize,
+  tx: mpsc::Sender<Datagram>,
+) {
+  let mut buf: Vec<u8> = Vec::with_capacity(RECV_BUFFER_SIZE);
+  let mut chunk = vec![0u8; RECV_BUFFER_SIZE];
+  let reason = 'read: loop {
+    let n = match reader.read(&mut chunk).await {
+      Ok(0) => break 'read "the server closed the connection".to_string(),
+      Err(e) => break 'read e.to_string(),
+      Ok(n) => n,
+    };
+    buf.extend_from_slice(&chunk[..n]);
+    loop {
+      match stream_frame_len(&buf) {
+        None => break 'read "the server sent a malformed frame".to_string(),
+        Some(0) => break,
+        Some(len) => {
+          let frame: Vec<u8> = buf.drain(..len).collect();
+          let dg = Datagram {
+            local,
+            from: server,
+            stream: Some(index),
+            via: Via::Socket,
+            data: BytesMut::from(&frame[..]),
+            closed: None,
+            ecn: None,
+          };
+          if tx.send(dg).await.is_err() {
+            return;
+          }
+        }
+      }
+    }
+  };
+  let _ = tx
+    .send(Datagram {
+      local,
+      from: server,
+      stream: Some(index),
+      via: Via::Socket,
+      data: BytesMut::new(),
+      closed: Some(reason),
+      ecn: None,
+    })
+    .await;
+}
+
+async fn write_stream<W: tokio::io::AsyncWrite + Unpin>(
+  mut writer: W,
+  mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+  // A failed write also ends the read side, which reports it.
+  while let Some(frame) = rx.recv().await {
+    if writer.write_all(&frame).await.is_err() {
+      let _ = writer.shutdown().await;
+      return;
+    }
+  }
+}
+
+/// Opens the TCP (or TLS) connection to a stream TURN server and starts its
+/// reader and writer; returns the writer's queue and the local address.
+async fn connect_stream(
+  peer: &Rc<Peer>,
+  spec: &IceServerSpec,
+  server: SocketAddr,
+  index: usize,
+) -> Result<(mpsc::UnboundedSender<Vec<u8>>, SocketAddr), String> {
+  let tcp = tokio::net::TcpStream::connect(server)
+    .await
+    .map_err(|e| format!("Could not connect to {}: {e}", spec.url))?;
+  let _ = tcp.set_nodelay(true);
+  let local = tcp.local_addr().map_err(|e| e.to_string())?;
+  let (writer_tx, writer_rx) = mpsc::unbounded_channel();
+  let recv_tx = peer.core.borrow().recv_tx.clone();
+  let cancel = peer.cancel.clone();
+  match spec.transport {
+    ServerTransport::Tls => {
+      let config = peer
+        .core
+        .borrow()
+        .options
+        .tls
+        .clone()
+        .ok_or_else(|| "TLS is not available here".to_string())?;
+      let name = rustls::pki_types::ServerName::try_from(spec.host.clone())
+        .map_err(|e| e.to_string())?;
+      let conn = rustls::ClientConnection::new(config, name)
+        .map_err(|e| e.to_string())?;
+      let mut stream =
+        rustls_tokio_stream::TlsStream::new_client_side(tcp, conn, None);
+      // Handshake first, so a refused certificate is reported now rather
+      // than as a request timeout.
+      stream
+        .handshake()
+        .await
+        .map_err(|e| format!("TLS handshake with {} failed: {e}", spec.url))?;
+      let (r, w) = stream.into_split();
+      deno_core::unsync::spawn(
+        read_stream(r, local, server, index, recv_tx).or_cancel(cancel.clone()),
+      );
+      deno_core::unsync::spawn(write_stream(w, writer_rx).or_cancel(cancel));
+    }
+    _ => {
+      let (r, w) = tcp.into_split();
+      deno_core::unsync::spawn(
+        read_stream(r, local, server, index, recv_tx).or_cancel(cancel.clone()),
+      );
+      deno_core::unsync::spawn(write_stream(w, writer_rx).or_cancel(cancel));
+    }
+  }
+  Ok((writer_tx, local))
+}
+
+/// Resolves one ICE server and starts its client.
+async fn add_server(peer: Rc<Peer>, spec: IceServerSpec) {
+  let finish = |peer: &Rc<Peer>, error: Option<String>| {
+    let mut core = peer.core.borrow_mut();
+    core.resolving = core.resolving.saturating_sub(1);
+    if let Some(text) = error {
+      core.report_error(&spec.url, None, ERROR_CODE_UNREACHABLE, text);
+    }
+    drop(core);
+    peer.poke();
+  };
+  let resolved: Vec<SocketAddr> =
+    match deno_net::resolve_addr::resolve_addr(&spec.host, spec.port).await {
+      Ok(addrs) => addrs.collect(),
+      Err(e) => {
+        finish(&peer, Some(format!("Could not resolve {}: {e}", spec.host)));
+        return;
+      }
+    };
+  // A family the connection has a socket for (UDP), or any (TCP/TLS).
+  let server = {
+    let core = peer.core.borrow();
+    resolved.iter().copied().find(|server| {
+      spec.transport != ServerTransport::Udp
+        || core.endpoints.iter().any(|e| {
+          e.bound.is_ipv4() == server.is_ipv4()
+            && (!e.bound.ip().is_loopback() || server.ip().is_loopback())
+        })
+    })
+  };
+  let Some(server) = server else {
+    finish(
+      &peer,
+      Some(format!(
+        "No local address can reach {} (interface enumeration or the \
+         wildcard listen permission may be denied)",
+        spec.host
+      )),
+    );
+    return;
+  };
+  // The URL's host was checked by the constructor; the address it resolved
+  // to must not be denied either.
+  if let Err(message) = peer.guard.connect(server) {
+    finish(&peer, Some(message));
+    return;
+  }
+  let shared = peer
+    .core
+    .borrow()
+    .options
+    .network
+    .as_ref()
+    .is_some_and(|n| n.is_shared());
+  if shared && spec.turn && spec.transport == ServerTransport::Udp {
+    finish(
+      &peer,
+      Some(
+        "TURN over UDP isn't available on a shared-port Deno.webrtc.Network \
+         (use ?transport=tcp or turns:)"
+          .to_string(),
+      ),
+    );
+    return;
+  }
+  let index = peer.core.borrow().servers.len();
+  let (link, base) = match spec.transport {
+    ServerTransport::Udp => {
+      let base = {
+        let mut core = peer.core.borrow_mut();
+        let Some(endpoint) = core
+          .endpoints
+          .iter()
+          .position(|e| e.bound.is_ipv4() == server.is_ipv4())
+        else {
+          drop(core);
+          finish(&peer, Some("No UDP socket for this family".to_string()));
+          return;
+        };
+        // The permission gate allowed `server` above.
+        core.local_address(endpoint, server, true)
+      };
+      (ServerLink::Udp, base)
+    }
+    ServerTransport::Tcp | ServerTransport::Tls => {
+      if !spec.turn {
+        // A server-reflexive address over TCP describes the TCP mapping,
+        // useless to a UDP agent.
+        finish(&peer, None);
+        return;
+      }
+      match connect_stream(&peer, &spec, server, index).await {
+        Ok((tx, local)) => (ServerLink::Stream(tx), local),
+        Err(text) => {
+          finish(&peer, Some(text));
+          return;
+        }
+      }
+    }
+  };
+  if peer.closed.get() {
+    return;
+  }
+  let protocol = match link {
+    ServerLink::Udp => TransportProtocol::UDP,
+    ServerLink::Stream(_) => TransportProtocol::TCP,
+  };
+  let config = TurnClientConfig {
+    stun_serv_addr: server.to_string(),
+    turn_serv_addr: if spec.turn {
+      server.to_string()
+    } else {
+      String::new()
+    },
+    local_addr: base,
+    transport_protocol: protocol,
+    username: spec.username.clone(),
+    password: spec.credential.clone(),
+    realm: String::new(),
+    software: String::new(),
+    rto_in_ms: 0,
+    allocation_refresh_interval_cap: None,
+  };
+  let provider = match rtc::crypto::default_provider() {
+    Ok(p) => p,
+    Err(e) => {
+      finish(&peer, Some(e.to_string()));
+      return;
+    }
+  };
+  let client = match TurnClient::new(config, provider) {
+    Ok(c) => c,
+    Err(e) => {
+      finish(&peer, Some(e.to_string()));
+      return;
+    }
+  };
+  {
+    let mut core = peer.core.borrow_mut();
+    // A server, not a remote candidate (ICE stays `new` without one).
+    core.allowed.insert(server);
+    let now = Instant::now();
+    let mut entry = ServerClient {
+      url: spec.url.clone(),
+      client,
+      base,
+      server,
+      link,
+      binding: None,
+      allocate: None,
+      relay: None,
+    };
+    if matches!(entry.link, ServerLink::Udp) {
+      entry.binding = entry.client.send_binding_request(now).ok();
+    }
+    if spec.turn {
+      entry.allocate = entry.client.allocate(now).ok();
+    }
+    core.servers.push(entry);
+  }
+  finish(&peer, None);
+}
+
+async fn run_driver(peer: Rc<Peer>, mut rx: mpsc::Receiver<Datagram>) {
+  loop {
+    if peer.closed.get() {
+      break;
+    }
+    let pumped = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      let mut core = peer.core.borrow_mut();
+      core.pump(&*peer.guard);
+      (!core.events.is_empty(), core.next_deadline())
+    }));
+    let Ok((has_events, deadline)) = pumped else {
+      peer.poison();
+      break;
+    };
+    if has_events {
+      peer.events_ready.notify_one();
+    }
+    let sleep = async {
+      match deadline {
+        Some(d) => {
+          tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await
+        }
+        None => std::future::pending::<()>().await,
+      }
+    };
+    let step = tokio::select! {
+      _ = peer.wake.notified() => None,
+      dg = rx.recv() => match dg {
+        Some(dg) => Some(Some(dg)),
+        None => break,
+      },
+      _ = sleep => Some(None),
+    };
+    let handled = std::panic::catch_unwind(AssertUnwindSafe(|| {
+      let mut core = peer.core.borrow_mut();
+      match step {
+        Some(Some(dg)) => {
+          core.handle_datagram(dg);
+          // Whatever else already arrived goes in before the next pump.
+          while let Ok(dg) = rx.try_recv() {
+            core.handle_datagram(dg);
+          }
+        }
+        Some(None) => core.handle_timeout(Instant::now()),
+        None => {}
+      }
+    }));
+    if handled.is_err() {
+      peer.poison();
+      break;
+    }
+  }
+}
+
+#[cfg(test)]
+pub(crate) fn frame_len_for_tests(buf: &[u8]) -> Option<usize> {
+  stream_frame_len(buf)
+}
+
+#[cfg(test)]
+impl Peer {
+  pub(crate) fn selected_for_tests(&self) -> Option<(SocketAddr, SocketAddr)> {
+    self.core.borrow().selected
+  }
+
+  pub(crate) fn selected_is_tcp_for_tests(&self) -> bool {
+    let core = self.core.borrow();
+    core.selected.is_some() && core.selected_tcp
+  }
+
+  pub(crate) fn mdns_open_for_tests(&self) -> bool {
+    self.core.borrow().mdns_socket.is_some()
+  }
+}
+
+#[cfg(test)]
+impl Core {
+  /// Test hook: a wildcard UDP endpoint on `socket` with these host
+  /// addresses; returns its index.
+  pub(crate) fn add_endpoint_for_test(
+    &mut self,
+    socket: UdpSocket,
+    hosts: Vec<IpAddr>,
+  ) -> usize {
+    let bound = socket.local_addr().unwrap();
+    self.endpoints.push(UdpEndpoint {
+      socket: Rc::new(EcnUdpSocket::new(socket)),
+      bound,
+      hosts,
+    });
+    self.endpoints.len() - 1
+  }
+
+  /// Test hook: one datagram through the driver's receive path.
+  pub(crate) fn handle_datagram_for_test(&mut self, dg: Datagram) {
+    self.handle_datagram(dg);
+  }
+
+  /// Test hook: how many peer routes are cached.
+  pub(crate) fn route_count_for_test(&self) -> usize {
+    self.routes.len()
+  }
+}

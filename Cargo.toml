@@ -310,11 +310,12 @@ rstest = "0"
 # channels, SRTP, RTP / RTCP and interceptors; MIT OR Apache-2.0) as published
 # on crates.io from Brainwires/rtci, a fork of webrtc-rs's `rtc` 0.22.0 with
 # its conformance, hardening and ECN work (the `0.22.0+brainwires.N` line
-# renamed `rtc` -> `rtci`, its version line restarted at 0.1.0). A semver
-# requirement, so later 0.1.x releases come in with `cargo update -p rtci`.
-# On the aws-lc-rs crypto provider, the one rustls already uses here. Pre-1.0
-# and not externally audited.
-rtci = { version = "0.1", default-features = false, features = ["crypto-aws-lc-rs"] }
+# renamed `rtc` -> `rtci`, its version line restarted at 0.1.0; 0.2.0, tag
+# `v0.2.0`, is its first breaking release). A semver requirement, so later
+# 0.2.x releases come in with `cargo update -p rtci`. On the aws-lc-rs crypto
+# provider, the one rustls already uses here. Pre-1.0 and not externally
+# audited.
+rtci = { version = "0.2", default-features = false, features = ["crypto-aws-lc-rs"] }
 rusqlite = { version = "0.40.0", features = ["unlock_notify", "bundled", "session", "modern_sqlite", "limits", "backup", "fallible_uint"] } # "modern_sqlite": need sqlite >= 3.49.0 for some db configs; "fallible_uint": ToSql for u64/usize (needed when crates like deno_cache are published/built standalone, not just feature-unified via denokv_sqlite)
 rustls = { version = "0.23.46", default-features = false, features = ["logging", "std", "tls12", "aws_lc_rs"] }
 rustls-native-certs = "0.8.5"

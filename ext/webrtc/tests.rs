@@ -2103,3 +2103,48 @@ async fn answer_to_a_narrow_offer_lists_only_its_formats() {
   a.close();
   b.close();
 }
+
+// setCodecPreferences() takes what getCapabilities() lists, for audio too:
+// a mono codec there has `channels: 1`, which the engine (whose rtpmap has
+// no encoding parameter for it) holds as 0 (WPT
+// RTCRtpTransceiver-setCodecPreferences "on audio transceiver with codecs
+// returned from RTCRtpReceiver.getCapabilities('audio')").
+#[test]
+fn audio_codec_preferences_take_the_capabilities() {
+  let peer = new_peer();
+  for (kind, sender) in [
+    ("audio", false),
+    ("audio", true),
+    ("video", false),
+    ("video", true),
+  ] {
+    let codecs = crate::media::capabilities(kind, sender)
+      .unwrap()
+      .expect("capabilities")
+      .codecs;
+    assert!(
+      codecs
+        .iter()
+        .any(|c| kind == "video" || c.channels == Some(1)),
+      "{kind} lists a mono codec"
+    );
+    let mut reordered = codecs.clone();
+    reordered.reverse();
+    peer
+      .media(|core| {
+        let key = core.add_transceiver(crate::media::TransceiverArg {
+          kind: kind.to_string(),
+          track: None,
+          direction: "sendrecv".to_string(),
+          streams: vec![],
+          send_encodings: vec![],
+          codec: None,
+          add_track: false,
+        })?;
+        core.set_codec_preferences(key, codecs)?;
+        core.set_codec_preferences(key, reordered)
+      })
+      .unwrap_or_else(|e| panic!("{kind} (sender {sender}): {e:?}"));
+  }
+  peer.close();
+}
